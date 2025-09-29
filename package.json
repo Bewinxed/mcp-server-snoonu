@@ -5,13 +5,18 @@
   "private": true,
   "devDependencies": {
     "@types/bun": "latest",
-    "chrome-remote-interface": "^0.33.3"
+    "chrome-remote-interface": "^0.33.3",
+    "electron": "^38.2.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
+    "@opentui/core": "^0.1.25",
+    "@types/react": "^19.1.14",
     "ai": "^5.0.56",
-    "playwright": "^1.55.1"
+    "ink": "^6.3.1",
+    "playwright": "^1.55.1",
+    "react": "^19.1.1"
   }
 }

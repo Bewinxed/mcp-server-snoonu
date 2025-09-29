@@ -5,6 +5,9 @@
       "ESNext",
       "DOM"
     ],
+    "types": [
+      "./types.d.ts"
+    ],
     "target": "ESNext",
     "module": "Preserve",
     "moduleDetection": "force",

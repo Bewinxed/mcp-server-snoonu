@@ -1,0 +1,12 @@
+{
+    "python.languageServer": "Pylance",
+    "ruff.interpreter": [
+        "./.venv/bin/python"
+    ],
+    "python.analysis.extraPaths": [
+        ".venv"
+    ],
+    "python.autoComplete.extraPaths": [
+        ".venv"
+    ]
+}
