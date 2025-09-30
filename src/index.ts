@@ -1,17 +1,48 @@
-import { chromium } from "playwright";
-import type { Browser, BrowserContext, Page, Cookie } from "playwright";
 import * as fs from "fs/promises";
 import * as path from "path";
+import type {
+	Browser,
+	BrowserContext,
+	Cookie,
+	Locator,
+	Page,
+} from "playwright";
+import { chromium } from "playwright";
 import * as readline from "readline";
 import { fileURLToPath } from "url";
+import type { GlobalSearch } from "./types/snoonu/global-search";
 import type {
-	BodyItem,
-	MarketPlaceSearch,
-} from "./types/snoonu/marketplace-search";
-import type { GlobalSearch, Product } from "./types/snoonu/global-search";
+	MerchantSuggestApiResponse,
+	MerchantSuggestionData,
+} from "./types/snoonu/suggest-in-merchants-api";
+import type {
+	GlobalSearchApiResponse,
+	Merchant as GlobalSearchApiMerchant,
+} from "./types/snoonu/global-search/api";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+type Merchant = {
+	name: string;
+	url: string | null;
+	distance: number | null;
+	min_eta: number | null;
+	items: Item[];
+	rating: number | null;
+	average_preparation_time: number | null;
+	is_free_delivery_eligible: boolean;
+};
+
+type Item = {
+	id: string | null;
+	name: string;
+	description: string | null;
+	image?: string | null;
+	price: number;
+	discounted_price: number | null;
+	url: string | null;
+};
 
 interface SessionData {
 	cookies: Cookie[];
@@ -20,6 +51,16 @@ interface SessionData {
 }
 
 let captured_data: Partial<GlobalSearch> = {};
+function chunkArray<T>(arr: T[], size: number): T[][] {
+	return arr.reduce((resultArray, item, index) => {
+		const chunkIndex = Math.floor(index / size);
+		if (!resultArray[chunkIndex]) {
+			resultArray[chunkIndex] = []; // start a new chunk
+		}
+		resultArray[chunkIndex].push(item);
+		return resultArray;
+	}, [] as T[][]);
+}
 
 class SnoonuAutomation {
 	private browser: Browser | null = null;
@@ -345,12 +386,12 @@ class SnoonuAutomation {
 		await this.page.hover("body"); // Hover anywhere on page
 	}
 
-	async performAction(action: () => Promise<void>) {
+	async performAction<T>(action: () => Promise<T>) {
 		// This method wraps any action and ensures login is handled if needed
 		if (!this.page) throw new Error("Page not initialized");
 
 		try {
-			await action();
+			return await action();
 		} catch (error) {
 			console.error("Action failed:", error);
 			// Check if login is needed
@@ -408,20 +449,261 @@ class SnoonuAutomation {
 		return captured_data.data.merchants;
 	}
 
-	async scrapeSearchProducts() {
-		if (!this.page) return;
-		type Merchant = {
-			name: string;
-			url: string;
-			items: Item[];
-		};
+	async exploreMerchantsInTabs(queries: string[], merchants: Merchant[]) {
+		if (!this.page || !this.context) return;
 
-		type Item = {
-			name: string;
-			image?: string | null;
-			price: number;
-			url: string;
-		};
+		if (!merchants || merchants.length === 0) {
+			console.log("❌ No merchants to explore");
+			return;
+		}
+
+		console.log(`🔎 Found ${merchants.length} merchants to explore`);
+		const result: {
+			[query: string]: { [merchant: string]: { products: Item[] } };
+		} = {};
+
+		async function exploreMerchant(
+			context: BrowserContext,
+			merchant: Merchant
+		) {
+			const page = await context.newPage();
+			const merchant_products = await scrapeMerchant({
+				queries,
+				page,
+				merchant,
+			});
+
+			await page.close();
+			return merchant_products;
+		}
+
+		const batches = merchants.reduce((resultArray, item, index) => {
+			const chunkIndex = Math.floor(index / 5);
+
+			if (!resultArray[chunkIndex]) {
+				resultArray[chunkIndex] = []; // start a new chunk
+			}
+
+			resultArray[chunkIndex].push(item);
+
+			return resultArray;
+		}, [] as Merchant[][]);
+
+		const results = queries.reduce((result, query) => {
+			result[query] = {};
+			return result;
+		}, {} as Record<string, Record<string, Item[]>>);
+
+		for (const batch of batches) {
+			const batch_results = await Promise.all(
+				batch.map((merchant) =>
+					exploreMerchant(this.context!, merchant).then((items) => ({
+						merchant: merchant.name,
+						items,
+					}))
+				)
+			);
+
+			for (const { items: queryItems, merchant } of batch_results) {
+				for (const [query, items] of Object.entries(queryItems)) {
+					for (const query in Object.entries(items))
+						if (!results[query]![merchant]) {
+							results[query]![merchant] = items;
+							continue;
+						}
+					results[query]![merchant]!.push(...items);
+				}
+			}
+		}
+
+		console.log(
+			`\n📊 Exploration complete. Explored ${
+				Object.keys(result).length
+			} queries across merchants`
+		);
+		return results;
+
+		async function scrapeMerchant({
+			queries,
+			page,
+			merchant,
+		}: {
+			queries: string[];
+			page: Page;
+			merchant: Merchant;
+		}) {
+			console.log(`\n📍 Exploring merchant: ${merchant.name}`);
+			const merchantUrl = `https://snoonu.com${merchant.url}`;
+			if (!page.url().includes(merchantUrl)) {
+				console.log(`   🌐 Opening: ${merchantUrl}`);
+				await page.goto(merchantUrl, {
+					waitUntil: "domcontentloaded",
+				});
+			}
+
+			const results = {} as {
+				[query: string]: Item[];
+			};
+
+			for (const query in queries) {
+				const queryResult = await queryMerchant(page, query);
+				results[query] = queryResult;
+			}
+
+			return results;
+
+			async function queryMerchant(page: Page, query: string) {
+				const searchBox = page.locator(
+					'[class*="SearchInMerchant_input"]'
+				);
+				await searchBox.waitFor({ state: "visible", timeout: 5000 });
+				await searchBox.fill(query, { timeout: 5000 });
+				const [response] = await Promise.all([
+					page.waitForResponse(
+						(resp) =>
+							resp
+								.url()
+								.includes("/api/search/suggest_in_merchant"),
+						{ timeout: 10000 }
+					),
+					searchBox.press("Enter"),
+				]);
+
+				if (response.ok()) {
+					const json =
+						(await response.json()) as MerchantSuggestApiResponse;
+					if (json.data?.length > 0) {
+						const items = json.data.map(
+							(item) =>
+								({
+									id: item.product_id,
+									name: item.name,
+									description: item.description,
+									image: item.image_url,
+									price:
+										item.discount && item.price_old
+											? Number.parseFloat(item.price_old)
+											: Number.parseFloat(item.price),
+									discounted_price:
+										item.discount && item.price_old
+											? Number.parseFloat(item.price_old)
+											: null,
+									url: null,
+								} satisfies Item)
+						);
+						return items;
+					}
+				}
+
+				const suggestedProducts = page.locator(
+					'[class*="SuggestedProducts_group"]'
+				);
+				await suggestedProducts.waitFor({
+					state: "visible",
+					timeout: 5000,
+				});
+
+				let merchant_suggestion_data:
+					| MerchantSuggestionData[]
+					| undefined;
+
+				if (merchant_suggestion_data) {
+					const items: Item[] = [];
+					items.push(
+						...merchant_suggestion_data.map(
+							(item) =>
+								({
+									id: item.product_id,
+									name: item.name,
+									image: item.image_url,
+									price:
+										item.discount && item.price_old
+											? Number.parseFloat(item.price_old)
+											: Number.parseFloat(item.price),
+									discounted_price:
+										item.discount && item.price_old
+											? Number.parseFloat(item.price_old)
+											: null,
+									description: item.description,
+									url: null,
+								} satisfies Item)
+						)
+					);
+					return items;
+				}
+
+				const productCards = await suggestedProducts
+					.locator('[data-analytic-label*="productCard"]')
+					.all();
+
+				async function scrapeProductCard(
+					productCard: Locator
+				): Promise<Item | undefined> {
+					const id = await productCard.getAttribute("id").catch(null);
+					const url = await productCard.getAttribute("href");
+					const name = await productCard
+						.locator('[class*="ProductCardHorizontal_name"]')
+						.textContent();
+					if (!name) return;
+					const description = await productCard
+						.locator('[class*="ProductCardHorizontal_description"]')
+						.textContent();
+					const price_wrapper = productCard.locator(
+						'[class*="priceWrapper"]'
+					);
+					const discount_wrapper = productCard.locator(
+						'[class*="pricePromo"]'
+					);
+					if (
+						await discount_wrapper.isVisible({
+							timeout: 3000,
+						})
+					) {
+						const price = await discount_wrapper
+							.locator('[class*="oldPrice"]')
+							.textContent();
+						if (!price) return;
+						const discountedPrice = await discount_wrapper
+							.locator('[class*="newPrice"]')
+							.textContent();
+						return {
+							id,
+							name,
+							description,
+							price: Number.parseFloat(price.split("QR").at(0)!),
+							discounted_price: Number.parseFloat(
+								discountedPrice!.split("QR").at(0)!
+							),
+							url,
+						};
+					}
+					const price = await price_wrapper
+						.locator("h5")
+						.textContent();
+					if (!price) return;
+
+					return {
+						id,
+						name,
+						description,
+						discounted_price: null,
+						price: Number.parseFloat(price.split("QR").at(0)!),
+						url,
+					};
+				}
+				const products = await Promise.all(
+					productCards.map((productCard) =>
+						scrapeProductCard(productCard)
+					)
+				).then((results) => results.filter((a) => !!a));
+
+				return products;
+			}
+		}
+	}
+
+	async scrapeSearchProducts(returnItems = false) {
+		if (!this.page) return;
 
 		const results: Merchant[] = [];
 
@@ -447,124 +729,204 @@ class SnoonuAutomation {
 			return results;
 		}
 
-		this.context?.setDefaultTimeout(1000);
+		this.context?.setDefaultTimeout(10000);
+		this.context?.setDefaultNavigationTimeout(20000);
 
 		console.log(`🔍 Found ${merchants.length} merchants`);
 
-		for (const merchant of merchants) {
-			// SearchMerchant_info
+		async function scrapeMerchantItems(
+			item: Locator
+		): Promise<Item | undefined> {
+			const id = await item.getAttribute("id");
+			if (!id) return;
+			const info = item.locator(
+				'div[class*="ProductCartVerticalDescription_info"]'
+			);
+			const price = await info
+				.locator('[class*="ProductCartVerticalDescription_price"]')
+				.textContent({
+					timeout: 1000,
+				})
+				.catch(() => null);
+			if (!price) return;
+			const name = await info
+				.locator('[class*="ProductCartVerticalDescription_name"]')
+				.textContent({
+					timeout: 1000,
+				})
+				.catch(() => null);
+			if (!name) return;
+			const url = await item
+				.locator("a")
+				.getAttribute("href", {
+					timeout: 1000,
+				})
+				.catch(() => null);
+
+			return {
+				id,
+				name,
+				description: null,
+				discounted_price: null,
+				// image,
+				price: parseFloat(price.split("QR").at(0)!),
+				url,
+			};
+		}
+
+		async function scrapeMerchant(merchant: Locator) {
 			const info = merchant.locator('div[class*="SearchMerchant_info"]');
-			if (!info) continue;
+			if (!info) return;
 			// name SearchMerchant_name_***
 			const name = await info
 				.locator('[class*="SearchMerchant_name"]')
 				.textContent();
 			console.log(`{🛍️ Processing ${name}`);
-			if (!name) continue;
+			if (!name) return;
 			const url = await merchant.locator(">a").getAttribute("href");
-			if (!url) continue;
+			if (!url) return;
 
 			// SearchMerchant_carousel***
 			const carousel = merchant.locator(
 				'div[class*="SearchMerchant_carousel"]'
 			);
-
-			// productCard class
-			const result: Merchant = {
-				name,
-				url,
-				items: [],
-			};
 			const items = await carousel.locator(">div").all();
 			console.log(`🔍 Found ${items.length} items for ${name}`);
-			for (const item of items) {
-				// const image = await item.locator(">img").getAttribute("src");
-				// info ProductCartVerticalDescription_info__
-				const info = await item.locator(
-					'div[class*="ProductCartVerticalDescription_info"]'
-				);
-				const price = await info
-					.locator('[class*="ProductCartVerticalDescription_price"]')
-					.textContent()
-					.catch(() => null);
-				console.log(price);
-				if (!price) continue;
-				const name = await info
-					.locator('[class*="ProductCartVerticalDescription_name"]')
-					.textContent()
-					.catch(() => null);
-				console.log(name);
-				if (!name) continue;
-				const url = await item.getAttribute("href");
-				if (!url) continue;
-				result.items.push({
-					name,
-					// image,
-					price: parseFloat(price),
-					url,
-				});
-			}
-			results.push(result);
+			const items_results = await Promise.all(
+				items.map((item) =>
+					returnItems ? scrapeMerchantItems(item) : null
+				)
+			).then((results) => results.filter((i) => !!i));
+			return {
+				name,
+				url,
+				items: items_results,
+			};
 		}
-
-		console.log(results);
-		return results;
+		const merchant_results = await Promise.all(
+			merchants.map((merchant) => scrapeMerchant(merchant))
+		).then((results) => results.filter((m) => !!m));
+		return merchant_results;
 	}
 
 	async searchProduct(
-		query: string,
+		queries: string[],
 		where: "Everywhere" | "Market" = "Everywhere"
 	) {
-		await this.performAction(async () => {
+		return await this.performAction(async () => {
 			if (!this.page) return;
 
-			// this.page.route("**/_next/data/**/search.json*", async (route) => {
+			const results: Merchant[] = [];
+			const batches = chunkArray(queries, 5);
+			for (const batch of batches) {
+				const batch_results = await Promise.all(
+					batch.map((query) => searchForItems(this.context!, query))
+				).then((results) => results.flat());
+				results.push(...batch_results);
+			}
 
-			// 	const response = await route.fetch();
-			// 	const body = await response.body();
-			// 	captured_data = JSON.parse(body.toString()) as {
-			// 		pageProps: MarketPlaceSearch;
-			// 	};
-			// 	await route.fulfill({
-			// 		json: captured_data,
-			// 	});
-			// });
+			return results;
 
-			this.page.route("**/search/global*", async (route) => {
-				console.log("📛 Intercepting global search");
-				const response = await route.fetch();
-				// clone response
-				const body = await response.body();
-				captured_data = JSON.parse(body.toString()) as GlobalSearch;
-				await route.fulfill({
-					json: captured_data,
+			async function searchForItems(
+				context: BrowserContext,
+				query: string
+			) {
+				console.log(`🔍 Searching for: ${query}`);
+				const page = await context.newPage();
+
+				await page.goto("https://snoonu.com");
+
+				const whereDropdown = page.locator(
+					"div[class*='SearchSelector_wrapper']"
+				);
+
+				await whereDropdown.waitFor({
+					state: "visible",
+					timeout: 5000,
 				});
-			});
 
-			console.log(`🔍 Searching for: ${query}`);
-			// set
-			const whereDropdown = this.page.locator(
-				"div[class*='SearchSelector_wrapper']"
-			);
-			if (whereDropdown) {
 				await whereDropdown.click();
+
+				console.log("🔍 Selecting where:", where);
+
+				const option = whereDropdown
+					.getByRole("listitem")
+					.filter({ hasText: where })
+					.first();
+				await option.click();
+
+				const searchBox = page.locator('input[placeholder*="Search"]');
+				await searchBox.click();
+				await searchBox.fill(query);
+				const [response] = await Promise.all([
+					page.waitForResponse(
+						(resp) =>
+							new URL(resp.url()).pathname.endsWith(
+								"search/global"
+							),
+						{ timeout: 10000 }
+					),
+					await searchBox.press("Enter"),
+				]);
+
+				if (!response.ok()) {
+					return [];
+				}
+
+				const json = (await response.json()) as GlobalSearchApiResponse;
+
+				async function mapMerchant(
+					merchant: GlobalSearchApiMerchant
+				): Promise<Merchant | null> {
+					if (
+						merchant.info_merchant.status.toLowerCase() !== "open"
+					) {
+						return null;
+					}
+					return {
+						name: merchant.name,
+						url: await page
+							.locator(
+								`a[href*='${merchant.url_friendly_name}']`,
+								{}
+							)
+							.first()
+							.getAttribute("href")
+							.catch(null),
+						distance: merchant.distance,
+						average_preparation_time:
+							merchant.average_preparation_time,
+						is_free_delivery_eligible:
+							merchant.subscription_benefits.s_plus
+								.is_free_delivery_eligible,
+						min_eta: merchant.min_eta,
+						rating: merchant.rating,
+						items: merchant.products
+							.filter((p) => p.is_instock && p.is_available)
+							.map((item) => ({
+								id: item.product_id,
+								name: item.name,
+								description: item.description,
+								image: item.image_url,
+								price:
+									item.discount && item.price_old
+										? Number.parseFloat(item.price_old)
+										: Number.parseFloat(item.price),
+								discounted_price:
+									item.discount && item.price_old
+										? Number.parseFloat(item.price_old)
+										: null,
+								url: null,
+							})),
+					};
+				}
+
+				const items = await Promise.all(
+					json.data.merchants.map(mapMerchant)
+				).then((results) => results.filter((i) => !!i));
+				await page.close();
+				return items;
 			}
-
-			const option = whereDropdown
-				.getByRole("listitem")
-				.filter({ hasText: where })
-				.first();
-			if (!option) {
-				console.error("No option found for:", where);
-				return;
-			}
-
-			await option.click();
-
-			const searchBox = this.page.locator('input[placeholder*="Search"]');
-			await searchBox.click();
-			await searchBox.fill(query);
-			await searchBox.press("Enter");
 		});
 	}
 
@@ -686,10 +1048,20 @@ async function main() {
 			return;
 		}
 
-		await automation.searchProduct(searchItem);
+		const results = await automation.searchProduct(["coffee", "carrots"]);
 
-		const products = await automation.globalSearchScrapeProducts();
-		console.log(products);
+		// const merchants = await automation.scrapeSearchProducts();
+		// console.log(merchants);
+		// if (!merchants || merchants.length === 0) {
+		// 	console.log("No merchants found");
+		// 	return;
+		// }
+		// const results = await automation.exploreMerchantsInTabs(
+		// 	[searchItem],
+		// 	merchants
+		// );
+
+		console.log(results);
 
 		// simulate random click
 
