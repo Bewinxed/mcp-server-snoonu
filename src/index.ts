@@ -18,7 +18,12 @@ import type {
 import type {
 	GlobalSearchApiResponse,
 	Merchant as GlobalSearchApiMerchant,
+	Product,
 } from "./types/snoonu/global-search/api";
+import { queryOpenRouter } from "./openrouter.ts";
+import { array, number, object, string } from "valibot";
+import type { SyncCartRequest } from "./types/snoonu/sync-cart.ts";
+import type { CartItem } from "./types/snoonu/cart-local-storage.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,6 +47,8 @@ type Item = {
 	price: number;
 	discounted_price: number | null;
 	url: string | null;
+	relevancy: number;
+	product: Product;
 };
 
 interface SessionData {
@@ -51,6 +58,123 @@ interface SessionData {
 }
 
 let captured_data: Partial<GlobalSearch> = {};
+
+const SNOONU_CATEGORIES = {
+	Restaurants: 62,
+	Groceries: 3,
+	Market: 3895,
+	Pharmacy: 129,
+	Flowers: 65,
+} as const;
+
+function sortItems(items: Item[]) {
+	// Find price range for scaling
+	const prices = items.map((i) => i.price);
+	const maxPrice = Math.max(...prices);
+	const minPrice = Math.min(...prices);
+	const priceRange = maxPrice - minPrice || 1;
+
+	return items.sort((a, b) => {
+		// Normalize price to 0-1 (lower is better)
+		const aNormPrice = (a.price - minPrice) / priceRange;
+		const bNormPrice = (b.price - minPrice) / priceRange;
+
+		// Relevancy already 0-1 (higher is better)
+		// So invert it to make it minimizable
+		const aNormRelevancy = 1 - a.relevancy;
+		const bNormRelevancy = 1 - b.relevancy;
+
+		// Combined score (lower is better)
+		const aScore = aNormPrice * 0.5 + aNormRelevancy * 0.5;
+		const bScore = bNormPrice * 0.5 + bNormRelevancy * 0.5;
+
+		return aScore - bScore;
+	});
+}
+
+type MerchantScore = {
+	merchant: Merchant;
+	bestItems: Item[];
+	subtotal: number;
+	deliveryFee: number;
+	total: number;
+	avgRelevancy: number;
+	eta: number;
+	rating: number;
+};
+
+function sortMerchants(
+	merchants: Merchant[],
+	quantityNeeded: number = 1
+): MerchantScore[] {
+	const scored = merchants
+		.map((merchant) => {
+			// Get items sorted by relevancy + price
+
+			const sortedItems = sortItems(merchant.items);
+			const bestItems = sortedItems.slice(0, quantityNeeded);
+
+			if (bestItems.length === 0) return null;
+
+			const subtotal = bestItems.reduce(
+				(sum, item) => sum + item.price,
+				0
+			);
+			const avgRelevancy =
+				bestItems.reduce((sum, item) => sum + item.relevancy, 0) /
+				bestItems.length;
+			const deliveryFee = merchant.is_free_delivery_eligible ? 0 : 10;
+
+			return {
+				merchant,
+				bestItems,
+				subtotal,
+				deliveryFee,
+				total: subtotal + deliveryFee,
+				avgRelevancy,
+				eta: merchant.min_eta,
+				rating: merchant.rating,
+			};
+		})
+		.filter((m): m is MerchantScore => m !== null);
+
+	// Sort by combined score
+	return scored.sort((a, b) => {
+		// Normalize factors to 0-1
+		const prices = scored.map((s) => s.total);
+		const maxPrice = Math.max(...prices);
+		const minPrice = Math.min(...prices);
+		const priceRange = maxPrice - minPrice || 1;
+
+		const aNormPrice = (a.total - minPrice) / priceRange;
+		const bNormPrice = (b.total - minPrice) / priceRange;
+
+		const aNormRelevancy = 1 - a.avgRelevancy;
+		const bNormRelevancy = 1 - b.avgRelevancy;
+
+		const aNormEta = a.eta / 60; // normalize to 0-1 assuming max 60 min
+		const bNormEta = b.eta / 60;
+
+		const aNormRating = 1 - a.rating / 5; // invert: higher rating = lower score
+		const bNormRating = 1 - b.rating / 5;
+
+		// Weighted score (adjust weights as needed)
+		const aScore =
+			aNormPrice * 0.5 + // price is most important
+			aNormRelevancy * 0.3 + // relevancy matters
+			aNormEta * 0.1 + // delivery time
+			aNormRating * 0.1; // merchant quality
+
+		const bScore =
+			bNormPrice * 0.5 +
+			bNormRelevancy * 0.3 +
+			bNormEta * 0.1 +
+			bNormRating * 0.1;
+
+		return aScore - bScore;
+	});
+}
+
 function chunkArray<T>(arr: T[], size: number): T[][] {
 	return arr.reduce((resultArray, item, index) => {
 		const chunkIndex = Math.floor(index / size);
@@ -60,6 +184,40 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 		resultArray[chunkIndex].push(item);
 		return resultArray;
 	}, [] as T[][]);
+}
+
+function levenshteinDistance(str1: string, str2: string): number {
+	const len1 = str1.length;
+	const len2 = str2.length;
+
+	// Create matrix
+	const matrix: number[][] = Array(len2 + 1)
+		.fill(null)
+		.map(() => Array(len1 + 1).fill(0));
+
+	// Initialize first row and column
+	for (let i = 0; i <= len2; i++) matrix[i]![0] = i;
+	for (let j = 0; j <= len1; j++) matrix[0]![j] = j;
+
+	// Fill matrix
+	for (let i = 1; i <= len2; i++) {
+		for (let j = 1; j <= len1; j++) {
+			const cost = str2[i - 1] === str1[j - 1] ? 0 : 1;
+			matrix[i]![j] = Math.min(
+				matrix[i - 1]![j]! + 1, // deletion
+				matrix[i]![j - 1]! + 1, // insertion
+				matrix[i - 1]![j - 1]! + cost // substitution
+			);
+		}
+	}
+
+	return matrix[len2]![len1]!;
+}
+
+function levenshteinSimilarity(str1: string, str2: string): number {
+	const distance = levenshteinDistance(str1, str2);
+	const maxLen = Math.max(str1.length, str2.length);
+	return maxLen === 0 ? 1 : 1 - distance / maxLen;
 }
 
 class SnoonuAutomation {
@@ -382,7 +540,6 @@ class SnoonuAutomation {
 
 		console.log(`🌐 Navigating to ${url}`);
 		await this.page.goto(url, { waitUntil: "domcontentloaded" });
-		console.log("👀 Hovering over page...");
 		await this.page.hover("body"); // Hover anywhere on page
 	}
 
@@ -404,7 +561,7 @@ class SnoonuAutomation {
 				await this.handleLoginFlow();
 				// Retry the action
 				console.log("Retrying action after login...");
-				await action();
+				return await action();
 			} else {
 				throw error;
 			}
@@ -809,29 +966,45 @@ class SnoonuAutomation {
 		return merchant_results;
 	}
 
-	async searchProduct(
-		queries: string[],
+	async searchProducts(
+		queries: {
+			term: string;
+			category?: keyof typeof SNOONU_CATEGORIES;
+			amount?: number | string;
+		}[],
 		where: "Everywhere" | "Market" = "Everywhere"
 	) {
 		return await this.performAction(async () => {
-			if (!this.page) return;
-
-			const results: Merchant[] = [];
+			const results: {
+				query: (typeof queries)[number];
+				merchants: Merchant[];
+			}[] = [];
 			const batches = chunkArray(queries, 5);
 			for (const batch of batches) {
 				const batch_results = await Promise.all(
-					batch.map((query) => searchForItems(this.context!, query))
+					batch.map((query) =>
+						searchForItem(this.context!, query).then(
+							(merchants) => ({
+								query,
+								merchants,
+							})
+						)
+					)
 				).then((results) => results.flat());
 				results.push(...batch_results);
 			}
 
 			return results;
 
-			async function searchForItems(
+			async function searchForItem(
 				context: BrowserContext,
-				query: string
+				{
+					term,
+					category = "Groceries",
+					amount,
+				}: (typeof queries)[number]
 			) {
-				console.log(`🔍 Searching for: ${query}`);
+				console.log(`🔍 Searching for: ${term}`);
 				const page = await context.newPage();
 
 				await page.goto("https://snoonu.com");
@@ -847,17 +1020,33 @@ class SnoonuAutomation {
 
 				await whereDropdown.click();
 
-				console.log("🔍 Selecting where:", where);
-
 				const option = whereDropdown
 					.getByRole("listitem")
 					.filter({ hasText: where })
 					.first();
 				await option.click();
 
+				if (category) {
+					await page.route(
+						"**/search/global*",
+						async (route, request) => {
+							const url = new URL(request.url());
+
+							// Modify query parameters
+							url.searchParams.set(
+								"category_id",
+								SNOONU_CATEGORIES[category].toString()
+							);
+
+							// Continue with modified URL
+							await route.continue({ url: url.toString() });
+						}
+					);
+				}
+
 				const searchBox = page.locator('input[placeholder*="Search"]');
 				await searchBox.click();
-				await searchBox.fill(query);
+				await searchBox.fill(term);
 				const [response] = await Promise.all([
 					page.waitForResponse(
 						(resp) =>
@@ -892,7 +1081,7 @@ class SnoonuAutomation {
 							)
 							.first()
 							.getAttribute("href")
-							.catch(null),
+							.catch(() => null),
 						distance: merchant.distance,
 						average_preparation_time:
 							merchant.average_preparation_time,
@@ -917,15 +1106,20 @@ class SnoonuAutomation {
 										? Number.parseFloat(item.price_old)
 										: null,
 								url: null,
+								relevancy: levenshteinSimilarity(
+									item.name,
+									term.toLowerCase()
+								),
+								product: item,
 							})),
 					};
 				}
 
-				const items = await Promise.all(
+				const merchants = await Promise.all(
 					json.data.merchants.map(mapMerchant)
 				).then((results) => results.filter((i) => !!i));
 				await page.close();
-				return items;
+				return merchants;
 			}
 		});
 	}
@@ -1048,20 +1242,402 @@ async function main() {
 			return;
 		}
 
-		const results = await automation.searchProduct(["coffee", "carrots"]);
+		// const results = await automation.searchProducts([
+		// 	{ term: "gluten free oats", category: "Groceries", amount: "1kg" },
+		// 	{ term: "honey", category: "Groceries", amount: "1kg" },
+		// 	{ term: "carrots", category: "Groceries", amount: "1kg" },
+		// 	{ term: "tomato", category: "Groceries", amount: "1kg" },
+		// 	{ term: "chicken breasts", category: "Groceries", amount: "1kg" },
+		// ]);
 
-		// const merchants = await automation.scrapeSearchProducts();
-		// console.log(merchants);
-		// if (!merchants || merchants.length === 0) {
-		// 	console.log("No merchants found");
-		// 	return;
-		// }
-		// const results = await automation.exploreMerchantsInTabs(
-		// 	[searchItem],
-		// 	merchants
+		const query = await queryOpenRouter(
+			// `give me a grocery cart for a fodmap diet,
+			// enough to make breakfast, lunch, and dinner,
+			// items should be proably available in qatar,
+			// 1 week supply,
+			// as well as snacks,
+			// the terms should be specific ITEMS (e.g eggs, chicken, potato, etc...)`
+			`give me a grocery cart for maximum weight loss while staying satiated,
+			enough to make breakfast, lunch, snacks, and dinner,
+			I have hypothyroidism,
+			no eggs, dairy, gluten, or nuts,
+			items should be available in qatar,
+			1 week supply,
+			as well as snacks,
+			the terms should be specific ITEMS (e.g eggs, chicken, potato, etc...), no extra notes/brackets`,
+			object({
+				notes: string(),
+				queries: array(
+					object({
+						term: string(),
+						amount: string(),
+					})
+				),
+				recipes: array(
+					object({
+						day: string(),
+						breakfast: string(),
+						lunch: string(),
+						snacks: string(),
+						dinner: string(),
+					})
+				),
+			}),
+			{
+				model: "x-ai/grok-code-fast-1",
+			}
+		);
+
+		console.table(query.recipes);
+
+		// const results = await automation.searchProducts(
+		// 	query.queries.map((q) => ({ ...q, category: "Groceries" }))
 		// );
 
-		console.log(results);
+		const results = await automation.searchProducts([
+			{ term: "quinoa", category: "Groceries", amount: "500g" },
+			{ term: "snow peas", category: "Groceries", amount: "500g" },
+			{ term: "asparagus", category: "Groceries", amount: "500g" },
+			{ term: "mushrooms", category: "Groceries", amount: "500g" },
+			{ term: "onions", category: "Groceries", amount: "500g" },
+			{ term: "garlic", category: "Groceries", amount: "500g" },
+		]);
+
+		const grouped = results.reduce((result, item) => {
+			item.merchants.forEach((merchant) => {
+				if (!result[merchant.name]) {
+					result[merchant.name] = {
+						average_preparation_time:
+							merchant.average_preparation_time,
+						is_free_delivery_eligible:
+							merchant.is_free_delivery_eligible,
+						min_eta: merchant.min_eta,
+						items: merchant.items,
+					};
+				} else {
+					result[merchant.name]!.items.push(...merchant.items);
+				}
+			});
+			return result;
+		}, {} as { [merchant: string]: Pick<Merchant, "items" | "min_eta" | "is_free_delivery_eligible" | "average_preparation_time"> });
+
+		// get first merchant
+		async function filterItemsWithLLM(queries: string[], items: Item[]) {
+			const simplified = {
+				items: items.map((item) => ({
+					id: item.id,
+					name: item.name,
+					description: item.description,
+				})),
+			};
+			const result = await queryOpenRouter(
+				`
+				The user has queries the marketplace AI for the following grocery items:
+				${JSON.stringify(queries, null, 2)}
+
+				We have collected and found the following items in the marketplace:
+				${JSON.stringify(simplified, null, 2)}
+				
+				Please return the product ids of the itmes that are relevant to their grocery list query: ${queries} discard irrelevant items
+				`,
+				object({
+					relevant_items: array(string()),
+				}),
+				{
+					model: "anthropic/claude-sonnet-4.5",
+				}
+			);
+
+			console.log(result);
+			return result;
+		}
+
+		async function chooseItemsWithLLM(
+			queries: {
+				term: string;
+				amount?: number | string;
+				quantity?: number;
+			}[],
+			preferences: string[],
+			items: {
+				[merchant: string]: Pick<
+					Merchant,
+					| "items"
+					| "min_eta"
+					| "is_free_delivery_eligible"
+					| "average_preparation_time"
+				>;
+			},
+			maxMerchants: number = 2
+		) {
+			const simplified = Object.entries(items).map(
+				([merchant, data]) => ({
+					merchant,
+					...data,
+					items: data.items
+						.map((item) => ({
+							id: item.id,
+							name: item.name,
+							description: item.description,
+							price: item.price,
+							discounted_price: item.discounted_price,
+						}))
+						.sort((a, b) => a.price - b.price),
+				})
+			);
+			const result = await queryOpenRouter(
+				`
+				The user has queries the marketplace AI for the following grocery items:
+				${JSON.stringify(
+					queries.map(({ term, amount, quantity }) => ({
+						term,
+						amount,
+						quantity,
+					})),
+					null,
+					2
+				)}
+
+				We have collected and found the following merchants and items the marketplace:
+				${JSON.stringify(simplified)}
+
+				The user has expressed some preferences regarding picking:
+				${preferences.map((pref) => `- ${pref}`).join("\n")}
+
+				return the ids for the items to add to cart, the max amount of merchants is ${maxMerchants}
+				Optimize the cart for the least amount of deliveries possible.
+				If more than 2 merchants, get the most items from the cheapest subtotal merchant.
+				`,
+				object({
+					notes: string(),
+					carts: array(
+						object({
+							merchant: string(),
+							relevant_items: array(
+								object({
+									id: string(),
+									quantity: number(),
+								})
+							),
+						})
+					),
+				}),
+				{
+					model: "google/gemini-2.5-flash",
+				}
+			);
+
+			console.log(result);
+			return result;
+		}
+
+		const llm_query = await chooseItemsWithLLM(
+			results.map((item) => item.query),
+			[
+				// "I don't want to buy products that are associated with Israel",
+				// "No NESCAFE",
+				// "multiple of smaller quantity is ok",
+			],
+			grouped
+		);
+
+		const result: {
+			id: string;
+			quantity: number;
+			product: Product;
+		}[] = [];
+		for (const cart of llm_query.carts) {
+			const final_result = grouped[cart.merchant]!.items.filter(
+				(item) =>
+					!!item.id &&
+					cart.relevant_items.map((i) => i.id).includes(item.id)
+			).map((item) => ({
+				id: item.id!,
+				quantity: cart.relevant_items
+					.filter((i) => i.id === item.id)
+					.at(0)!.quantity,
+				product: item.product,
+			}));
+			result.push(...final_result);
+		}
+
+		await addItemsToCart(result);
+
+		async function addItemsToCart(
+			items: {
+				id: string;
+				quantity: number;
+				product: Product;
+			}[]
+		) {
+			// Set up response listener BEFORE making the request
+			const data: SyncCartRequest = {
+				items: items.map((item) => ({
+					product_identity: {
+						product_id: item.id,
+						choice_item_ids: [],
+						special_request: "",
+					},
+					quantity: item.quantity,
+				})),
+			};
+			const page = await automation.getPage();
+			if (page) {
+				const responsePromise = page.waitForResponse((response) =>
+					response.url().includes("/api/v1/multicart/sync")
+				);
+
+				// Make the request in browser context
+				const resultPromise = page.evaluate(
+					async ({ data, items }) => {
+						const deviceId =
+							localStorage.getItem("snoonu-app-device-id") ||
+							"web-b741f08b596dfbba55b94f93d08ea032";
+						const token = localStorage.getItem("token") || "";
+
+						const headers = {
+							accept: "*/*",
+							"content-type": "application/json",
+							appversion: "2",
+							language: "en",
+							latitude: "25.30015325558983",
+							longitude: "51.49286493659019",
+							"snoonu-app-device-id": deviceId,
+							"snoonu-app-platform": "Web",
+							"snoonu-app-version": "65535.65535.65535.65535",
+							token: token,
+						};
+
+						const response = await fetch(
+							"https://snoomarket-web.snoonu.com/api/v1/multicart/sync",
+							{
+								method: "POST",
+								headers,
+								body: JSON.stringify(data),
+								mode: "cors",
+								credentials: "omit",
+							}
+						);
+
+						await fetch(
+							"https://admin.snoonu.com/api/v5/orders/open",
+							{
+								headers,
+								referrer: "https://snoonu.com/",
+								body: null,
+								method: "GET",
+								mode: "cors",
+								credentials: "include",
+							}
+						);
+
+						const cartProducts = items.reduce((acc, item, i) => {
+							acc[`_${item.id}`] = {
+								isDeleted: false,
+								isInstock: true,
+								imageUrl: item.product.image_url,
+								additionalRequired: 0,
+								businessUnitId:
+									item.product.business_unit_main_category_id,
+								name: item.product.name,
+								englishName: item.product.name,
+								id: i,
+								productId: item.id,
+								businessUnitMainCategoryId:
+									item.product.business_unit_main_category_id,
+								images: [item.product.image_url],
+								price: item.product.price.toString(),
+								minPrice: parseFloat(item.product.price),
+								basePrice: parseFloat(item.product.price),
+								description: item.product.description || "",
+								stockCount: item.product.stock_count,
+								discount: 0,
+								isAvailable: true,
+								count: item.quantity,
+								notes: "",
+								uuid: `_${item.id}`,
+								totalPrice:
+									parseFloat(item.product.price) *
+									item.quantity,
+								selectedAdditional: [],
+								lastAddedIndex: 0,
+								productMerchant: null,
+								additionalData: item.product.additional_data,
+								merchantId: item.product.merchant_id,
+								businessUnitName:
+									item.product.business_unit_main_category_id,
+								hasBuyOneGetOne:
+									item.product.has_buy_one_get_one,
+								marketPlaceDiscount:
+									item.product.market_place_discount,
+								marketPlacePrice:
+									item.product.market_place_price,
+								marketplaceMainCategories:
+									item.product.marketplace_main_categories,
+								marketplaceSubCategories:
+									item.product.marketplace_sub_categories,
+								marketplaceProductGroups:
+									item.product.marketplace_product_groups,
+								notRoundedDiscount:
+									item.product.not_rounded_discount,
+								productOrderLimit:
+									item.product.product_order_limit,
+								promoted: item.product.promoted,
+								productTags: item.product.product_tags,
+								urlFriendlyName: item.product.url_friendly_name,
+								vertical: item.product.vertical,
+							} satisfies CartItem;
+							return acc;
+						}, {} as Record<string, any>);
+
+						localStorage.setItem(
+							"marketplaceCartProducts",
+							JSON.stringify(cartProducts)
+						);
+						localStorage.setItem(
+							"marketplaceCartIsShown",
+							'"true"'
+						);
+
+						// Try to access MobX store and update it directly (may not work)
+						try {
+							// NextJS stores initial state here
+							const nextData = (window as any).__NEXT_DATA__;
+							if (
+								nextData?.props?.pageProps?.initialState
+									?.marketplaceCartStore
+							) {
+								const store =
+									nextData.props.pageProps.initialState
+										.marketplaceCartStore;
+								store.cartProducts = cartProducts;
+							}
+						} catch (e) {
+							console.log(
+								"Could not update MobX store directly, will reload"
+							);
+						}
+
+						return await response.json();
+					},
+					{ data, items }
+				);
+
+				// Wait for both
+				const [response, result] = await Promise.all([
+					responsePromise,
+					resultPromise,
+				]);
+
+				// Now you can inspect the response
+				console.log("Status:", response.status());
+				console.log("Headers:", response.headers());
+				console.log("Body:", await response.json());
+
+				await page.goto("https://snoonu.com/checkout");
+				return result;
+			}
+		}
 
 		// simulate random click
 

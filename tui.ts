@@ -34,7 +34,7 @@ class SnoonuTUI {
 					);
 					return;
 				}
-				await agent.searchProduct(args);
+				await agent.searchProducts(args);
 				this.updateResults(
 					`Searching for: ${args}\nCheck browser window for results`
 				);
