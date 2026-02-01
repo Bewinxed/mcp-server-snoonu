@@ -440,6 +440,26 @@ class SnoonuAutomation {
 		}, this.config.checkLoginInterval);
 	}
 
+	private async dismissLocationModal() {
+		if (!this.page) return;
+
+		try {
+			// Check if location modal is visible and dismiss it
+			const locationModal = this.page.locator('button:has-text("Confirm location")');
+			if (await locationModal.isVisible({ timeout: 2000 }).catch(() => false)) {
+				// Try to click the close button on the location modal
+				const closeBtn = this.page.locator('.Modal_cross__eQNMb, [class*="Modal_cross"]').first();
+				if (await closeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+					console.log("📍 Dismissing location modal...");
+					await closeBtn.click();
+					await this.page.waitForTimeout(500);
+				}
+			}
+		} catch (error) {
+			// Location modal not present, continue
+		}
+	}
+
 	private async handleLoginFlow() {
 		if (this.isHandlingLogin || !this.page) return;
 
@@ -447,11 +467,12 @@ class SnoonuAutomation {
 		console.log("🔄 Handling login flow...");
 
 		try {
-			// Step 1: Enter phone number
+			// Dismiss location modal if present
+			await this.dismissLocationModal();
+
+			// Step 1: Enter phone number using data-test-id selector
 			console.log("📱 Entering phone number...");
-			const phoneInput = this.page.locator(
-				'input[placeholder="Mobile Number"]'
-			);
+			const phoneInput = this.page.locator('[data-test-id="phoneInputField"]');
 			await phoneInput.waitFor({ state: "visible", timeout: 5000 });
 
 			// Get phone number if not configured
@@ -465,33 +486,35 @@ class SnoonuAutomation {
 			await phoneInput.click();
 			await phoneInput.fill(phoneNumber);
 
-			// Click continue
+			// Click continue using data-test-id selector
 			console.log("➡️ Clicking continue...");
-			await this.page.click('button:has-text("Continue")');
+			await this.page.locator('[data-test-id="btnContinueLogin"]').click();
 
 			// Step 2: Handle OTP
 			console.log("⏳ Waiting for OTP screen...");
 
-			// Wait for OTP inputs to appear
-			const otpLocator = this.page.locator('input[name="pin"]');
-
+			// Wait for OTP input to appear using data-test-id selector
+			const otpLocator = this.page.locator('[data-test-id="pinInputField"]');
 			await otpLocator.waitFor({ state: "visible", timeout: 30000 });
 
 			// Get OTP from user
 			const otp = await this.promptUser("Enter OTP code: ");
 
-			// Fill OTP inputs
+			// Fill OTP input
 			console.log("🔢 Entering OTP...");
-
 			await otpLocator.fill(otp);
 
-			// Wait for login to complete
+			// Wait for login to complete - check for login button to disappear
 			console.log("⏳ Waiting for login to complete...");
-
-			// Wait for modal to disappear
-			await this.page.waitForSelector('text="Log in to see discounts"', {
+			await this.page.waitForSelector('[data-test-id="loginBtn"]', {
 				state: "hidden",
 				timeout: 15000,
+			}).catch(() => {
+				// Alternative: wait for modal to close
+				return this.page!.waitForSelector('.modal', {
+					state: "hidden",
+					timeout: 15000,
+				});
 			});
 
 			console.log("✅ Login successful!");
@@ -543,7 +566,67 @@ class SnoonuAutomation {
 
 		console.log(`🌐 Navigating to ${url}`);
 		await this.page.goto(url, { waitUntil: "domcontentloaded" });
+		await this.page.waitForTimeout(1000);
+
+		// Dismiss location modal if it appears
+		await this.dismissLocationModal();
+
 		await this.page.hover("body"); // Hover anywhere on page
+	}
+
+	async clickLoginButton() {
+		if (!this.page) throw new Error("Page not initialized");
+
+		console.log("🔐 Clicking login button...");
+		await this.page.locator('[data-test-id="loginBtn"]').click();
+		await this.page.waitForTimeout(1000);
+
+		// Dismiss location modal if it appears after clicking login
+		await this.dismissLocationModal();
+	}
+
+	async searchProducts_UI(query: string) {
+		if (!this.page) throw new Error("Page not initialized");
+
+		console.log(`🔍 Searching for: ${query}`);
+
+		// Use the search field with data-test-id
+		const searchField = this.page.locator('[data-test-id="searchField"]');
+		await searchField.fill(query);
+		await searchField.press("Enter");
+
+		// Wait for search results to load
+		await this.page.waitForURL(/\/search\?q=/, { timeout: 10000 });
+		await this.page.waitForTimeout(2000);
+
+		console.log(`✅ Search complete for: ${query}`);
+	}
+
+	async addProductToCart(productRef: string) {
+		if (!this.page) throw new Error("Page not initialized");
+
+		console.log(`🛒 Adding product to cart...`);
+		// Click Add button on a product card
+		await this.page.locator(`[ref="${productRef}"]`).click();
+		await this.page.waitForTimeout(1000);
+	}
+
+	async goToCart() {
+		if (!this.page) throw new Error("Page not initialized");
+
+		console.log("🛒 Going to cart...");
+		await this.page.goto("https://snoonu.com/cart", { waitUntil: "domcontentloaded" });
+		await this.page.waitForTimeout(1000);
+	}
+
+	async goToCheckout() {
+		if (!this.page) throw new Error("Page not initialized");
+
+		console.log("💳 Going to checkout...");
+		await this.page.locator('[data-test-id="goToCheckoutBtn"]').click();
+		await this.page.waitForURL(/\/checkout/, { timeout: 10000 });
+		await this.page.waitForTimeout(1000);
+		console.log("✅ Reached checkout page");
 	}
 
 	async performAction<T>(action: () => Promise<T>) {

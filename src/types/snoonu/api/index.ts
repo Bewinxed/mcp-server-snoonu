@@ -6,6 +6,7 @@ export * from "./global-search";
 export * from "./suggest-in-merchant";
 export * from "./multicart";
 export * from "./orders";
+export * from "./checkout";
 
 // Re-export request types for convenience
 export type {
@@ -28,3 +29,14 @@ export type {
 } from "./multicart";
 
 export type { OpenOrdersResponse, Order, OrderStatus } from "./orders";
+
+export type {
+	CheckoutAddress,
+	PaymentMethod,
+	PaymentMethodType,
+	CheckoutOrderSummary,
+	CheckoutItem,
+	PlaceOrderRequest,
+	PlaceOrderResponse,
+	PlaceOrderData,
+} from "./checkout";
