@@ -104,3 +104,14 @@ bun --hot ./index.ts
 ```
 
 For more information, read the Bun API docs in `node_modules/bun-types/docs/**.md`.
+
+<!-- BEGIN WDYT -->
+## Code Analysis Tools (MCP)
+When exploring code, prefer the wdyt MCP tools over raw grep/read:
+- Use tldr_codemap to get file overviews instead of reading entire files
+- Use tldr_impact to find function callers/callees instead of grepping
+- Use tldr_semantic_search to find related code by behavior
+- Use tldr_structure to list all definitions in a file
+- Use tldr_context for deep investigation of a specific function
+- Use tldr_complexity to check cyclomatic complexity before refactoring
+<!-- END WDYT -->

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "wdyt": {
+      "type": "stdio",
+      "command": "bunx",
+      "args": [
+        "-b",
+        "wdyt-mcp"
+      ]
+    }
+  }
+}

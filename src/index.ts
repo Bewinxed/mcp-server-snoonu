@@ -12,22 +12,21 @@ import * as readline from "readline";
 import { fileURLToPath } from "url";
 import { array, number, object, string } from "valibot";
 import { queryOpenRouter } from "./openrouter.ts";
-import type { CartItem } from "./types/snoonu/cart-local-storage.ts";
-import type { GlobalSearch } from "./types/snoonu/global-search";
 import type {
-	Merchant as GlobalSearchApiMerchant,
-	GlobalSearchApiRequestParams,
-	Product,
-} from "./types/snoonu/global-search/api";
-import type {
+	GlobalSearchResponse as GlobalSearch,
+	GlobalSearchRequest as GlobalSearchApiRequestParams,
+	GlobalSearchMerchant as GlobalSearchApiMerchant,
+	GlobalSearchProduct as Product,
 	SuggestInMerchantRequest,
 	SuggestInMerchantResponse,
-} from "./types/snoonu/merchant-page/suggest-in-merchant.ts";
+	SuggestInMerchantProduct,
+	MulticartSyncRequest as SyncCartRequest,
+} from "./types/snoonu/api";
+import type { CartItem } from "./types/snoonu/cart-local-storage.ts";
 import type {
 	MerchantSuggestApiResponse,
 	MerchantSuggestionData,
 } from "./types/snoonu/suggest-in-merchants-api";
-import type { SyncCartRequest } from "./types/snoonu/sync-cart.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,8 +50,8 @@ type Item = {
 	price: number;
 	discounted_price: number | null;
 	url: string | null;
-	relevance_score: number;
-	product: Product;
+	relevance_score?: number;
+	product?: Product;
 };
 
 interface SessionData {
@@ -85,8 +84,8 @@ function sortItems(items: Item[]) {
 
 		// Relevancy already 0-1 (higher is better)
 		// So invert it to make it minimizable
-		const aNormRelevancy = 1 - a.relevance_score;
-		const bNormRelevancy = 1 - b.relevance_score;
+		const aNormRelevancy = 1 - (a.relevance_score ?? 0);
+		const bNormRelevancy = 1 - (b.relevance_score ?? 0);
 
 		// Combined score (lower is better)
 		const aScore = aNormPrice * 0.5 + aNormRelevancy * 0.5;
@@ -125,7 +124,7 @@ function sortMerchants(
 				0
 			);
 			const avgRelevancy =
-				bestItems.reduce((sum, item) => sum + item.relevance_score, 0) /
+				bestItems.reduce((sum, item) => sum + (item.relevance_score ?? 0), 0) /
 				bestItems.length;
 			const deliveryFee = merchant.is_free_delivery_eligible ? 0 : 10;
 
@@ -279,9 +278,9 @@ class SnoonuAutomation {
 
 		if (sessionExists) {
 			console.log("📂 Loading saved session...");
-			const session: SessionData = JSON.parse(
+			const session = JSON.parse(
 				await fs.readFile(this.sessionFile, "utf-8")
-			);
+			) as SessionData;
 
 			// Create context with stored cookies and storage state
 			this.context = await this.browser!.newContext({
@@ -322,9 +321,9 @@ class SnoonuAutomation {
 	private async loadSession(): Promise<boolean> {
 		try {
 			await fs.access(this.sessionFile);
-			const session: SessionData = JSON.parse(
+			const session = JSON.parse(
 				await fs.readFile(this.sessionFile, "utf-8")
-			);
+			) as SessionData;
 
 			// Check if we have valid auth cookies
 			const hasAuthToken = session.cookies.some(
@@ -1519,7 +1518,7 @@ async function main() {
 						merchant,
 						...merchant,
 						items: merchant.items
-							.filter((i) => i.relevance_score > minRelevance)
+							.filter((i) => (i.relevance_score ?? 0) > minRelevance)
 							.map((item) => ({
 								id: item.id,
 								name: item.name,
@@ -1611,13 +1610,14 @@ async function main() {
 			const final_result = grouped[cart.merchant]!.items.filter(
 				(item) =>
 					!!item.id &&
+					!!item.product &&
 					cart.relevant_items.map((i) => i.id).includes(item.id)
 			).map((item) => ({
 				id: item.id!,
 				quantity: cart.relevant_items
 					.filter((i) => i.id === item.id)
 					.at(0)!.quantity,
-				product: item.product,
+				product: item.product!,
 			}));
 			result.push(...final_result);
 		}

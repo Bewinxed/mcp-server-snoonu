@@ -29,8 +29,8 @@ export interface CartItem {
 	marketplaceMainCategories: string[];
 	marketplaceSubCategories: string[];
 	marketplaceProductGroups: string[];
-	urlFriendlyName: string;
-	productTags: Record<string, BySnoonu>;
+	urlFriendlyName: string | null;
+	productTags: Record<string, BySnoonu> | object;
 	isDeleted: boolean;
 	count: number;
 	notes: string;
