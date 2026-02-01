@@ -1,12 +1,14 @@
-export interface GlobalSearchApiResponse {
+import type { Status } from "../global-search";
+
+export interface GlobalSearch {
 	status: string;
 	message: null;
 	error: null;
-	data: GlobalSearchApiData;
+	data: Data;
 	is_success: boolean;
 }
 
-export interface GlobalSearchApiData {
+export interface Data {
 	merchants: Merchant[];
 	analytics: Analytics;
 	tag_filters: any[];
@@ -24,11 +26,11 @@ export interface Merchant {
 	time_value: string;
 	time_unit: "mins";
 	min_eta: number;
-	status_merchant: StatusMerchant;
+	status_merchant: Status;
 	info_merchant: InfoMerchant;
-	product_view: ProductView;
+	product_view: "list" | "Grid";
 	brand_id: string;
-	main_category_id: "61820a73c77f5ff17a305bb5";
+	main_category_id: string;
 	menu_id: number;
 	has_inventory: boolean;
 	has_more_item: boolean;
@@ -52,24 +54,9 @@ export interface Merchant {
 export interface InfoMerchant {
 	status: Status;
 	time: string;
-	title: Title;
+	title: string;
 	message: string;
 	is_always_available: boolean;
-}
-
-export enum Status {
-	Closed = "Closed",
-	Open = "Open",
-}
-
-export enum Title {
-	ClosedUntil900AM = "Closed Until 9:00 AM",
-	Empty = "",
-}
-
-export enum ProductView {
-	List = "list",
-	SubCategoryView = "subCategoryView",
 }
 
 export interface Product {
@@ -78,19 +65,19 @@ export interface Product {
 	english_name: string;
 	id: number;
 	object_id: string;
-	query_id: null;
+	query_id: string | null;
 	product_id: string;
 	business_unit_main_category_id: string;
 	image_url: string;
 	images: string[];
 	price: string;
-	price_old: null | string;
+	price_old: null;
 	min_price: number;
 	base_price: number;
 	market_place_price: number;
 	market_place_discount: number;
-	web_non_auth_price: null;
-	description: null;
+	web_non_auth_price: number | null;
+	description: string | null;
 	is_instock: boolean;
 	discount: number;
 	not_rounded_discount: number;
@@ -102,16 +89,43 @@ export interface Product {
 	additional_required: number;
 	relevance_score: null;
 	product_order_limit: number;
-	additional_data: any[];
+	additional_data: AdditionalDatum[];
 	is_available: boolean;
 	vertical: number;
 	marketplace_main_categories: any[];
 	marketplace_sub_categories: any[];
 	marketplace_product_groups: any[];
-	url_friendly_name: string;
+	url_friendly_name: string | null;
 	product_tags: ProductTags;
 	rating_info: null;
 	food_item_rating: null;
+}
+
+export interface AdditionalDatum {
+	id: string;
+	name: string;
+	english_name: string;
+	name_ar: null;
+	view_type: number;
+	mode: number;
+	min: number;
+	max: number;
+	is_same_image: boolean;
+	data: Datum[];
+}
+
+export interface Datum {
+	id: number;
+	additional_option_id: string;
+	name: string;
+	english_name: string;
+	name_ar: null;
+	price: string;
+	is_default: boolean;
+	image: string;
+	main_image: string;
+	is_available: boolean;
+	price_raw: number;
 }
 
 export interface ProductTags {}
@@ -119,11 +133,6 @@ export interface ProductTags {}
 export interface Promotion {
 	kind: number;
 	value: string;
-}
-
-export enum StatusMerchant {
-	AvailableForScheduledDelivery = "available_for_scheduled_delivery",
-	Open = "open",
 }
 
 export interface SubscriptionBenefits {

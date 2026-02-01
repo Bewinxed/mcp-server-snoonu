@@ -10,20 +10,24 @@ import type {
 import { chromium } from "playwright";
 import * as readline from "readline";
 import { fileURLToPath } from "url";
+import { array, number, object, string } from "valibot";
+import { queryOpenRouter } from "./openrouter.ts";
+import type { CartItem } from "./types/snoonu/cart-local-storage.ts";
 import type { GlobalSearch } from "./types/snoonu/global-search";
+import type {
+	Merchant as GlobalSearchApiMerchant,
+	GlobalSearchApiRequestParams,
+	Product,
+} from "./types/snoonu/global-search/api";
+import type {
+	SuggestInMerchantRequest,
+	SuggestInMerchantResponse,
+} from "./types/snoonu/merchant-page/suggest-in-merchant.ts";
 import type {
 	MerchantSuggestApiResponse,
 	MerchantSuggestionData,
 } from "./types/snoonu/suggest-in-merchants-api";
-import type {
-	GlobalSearchApiResponse,
-	Merchant as GlobalSearchApiMerchant,
-	Product,
-} from "./types/snoonu/global-search/api";
-import { queryOpenRouter } from "./openrouter.ts";
-import { array, number, object, string } from "valibot";
 import type { SyncCartRequest } from "./types/snoonu/sync-cart.ts";
-import type { CartItem } from "./types/snoonu/cart-local-storage.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,7 +51,7 @@ type Item = {
 	price: number;
 	discounted_price: number | null;
 	url: string | null;
-	relevancy: number;
+	relevance_score: number;
 	product: Product;
 };
 
@@ -81,8 +85,8 @@ function sortItems(items: Item[]) {
 
 		// Relevancy already 0-1 (higher is better)
 		// So invert it to make it minimizable
-		const aNormRelevancy = 1 - a.relevancy;
-		const bNormRelevancy = 1 - b.relevancy;
+		const aNormRelevancy = 1 - a.relevance_score;
+		const bNormRelevancy = 1 - b.relevance_score;
 
 		// Combined score (lower is better)
 		const aScore = aNormPrice * 0.5 + aNormRelevancy * 0.5;
@@ -121,7 +125,7 @@ function sortMerchants(
 				0
 			);
 			const avgRelevancy =
-				bestItems.reduce((sum, item) => sum + item.relevancy, 0) /
+				bestItems.reduce((sum, item) => sum + item.relevance_score, 0) /
 				bestItems.length;
 			const deliveryFee = merchant.is_free_delivery_eligible ? 0 : 10;
 
@@ -972,7 +976,8 @@ class SnoonuAutomation {
 			category?: keyof typeof SNOONU_CATEGORIES;
 			amount?: number | string;
 		}[],
-		where: "Everywhere" | "Market" = "Everywhere"
+		where: "Everywhere" | "Market" = "Everywhere",
+		deepSearch = false
 	) {
 		return await this.performAction(async () => {
 			const results: {
@@ -983,7 +988,7 @@ class SnoonuAutomation {
 			for (const batch of batches) {
 				const batch_results = await Promise.all(
 					batch.map((query) =>
-						searchForItem(this.context!, query).then(
+						searchForItem(this.context!, query, deepSearch).then(
 							(merchants) => ({
 								query,
 								merchants,
@@ -1002,67 +1007,145 @@ class SnoonuAutomation {
 					term,
 					category = "Groceries",
 					amount,
-				}: (typeof queries)[number]
+				}: (typeof queries)[number],
+				deepSearch = true
 			) {
 				console.log(`🔍 Searching for: ${term}`);
 				const page = await context.newPage();
 
 				await page.goto("https://snoonu.com");
 
-				const whereDropdown = page.locator(
-					"div[class*='SearchSelector_wrapper']"
-				);
+				// const whereDropdown = page.locator(
+				// 	"div[class*='SearchSelector_wrapper']"
+				// );
 
-				await whereDropdown.waitFor({
-					state: "visible",
-					timeout: 5000,
-				});
+				// await whereDropdown.waitFor({
+				// 	state: "visible",
+				// 	timeout: 5000,
+				// });
 
-				await whereDropdown.click();
+				// await whereDropdown.click();
 
-				const option = whereDropdown
-					.getByRole("listitem")
-					.filter({ hasText: where })
-					.first();
-				await option.click();
+				// const option = whereDropdown
+				// 	.getByRole("listitem")
+				// 	.filter({ hasText: where })
+				// 	.first();
+				// await option.click();
 
-				if (category) {
-					await page.route(
-						"**/search/global*",
-						async (route, request) => {
-							const url = new URL(request.url());
+				// if (category) {
+				// 	await page.route(
+				// 		"**/search/global*",
+				// 		async (route, request) => {
+				// 			const url = new URL(request.url());
 
-							// Modify query parameters
-							url.searchParams.set(
-								"category_id",
-								SNOONU_CATEGORIES[category].toString()
-							);
+				// 			// Modify query parameters
+				// 			url.searchParams.set(
+				// 				"category_id",
+				// 				SNOONU_CATEGORIES[category].toString()
+				// 			);
 
-							// Continue with modified URL
-							await route.continue({ url: url.toString() });
-						}
+				// 			// Continue with modified URL
+				// 			await route.continue({ url: url.toString() });
+				// 		}
+				// 	);
+				// }
+
+				// const searchBox = page.locator('input[placeholder*="Search"]');
+				// await searchBox.click();
+				// await searchBox.fill(term);
+				// const [response] = await Promise.all([
+				// 	page.waitForResponse(
+				// 		(resp) =>
+				// 			new URL(resp.url()).pathname.endsWith(
+				// 				"search/global"
+				// 			),
+				// 		{ timeout: 10000 }
+				// 	),
+				// 	await searchBox.press("Enter"),
+				// ]);
+
+				// if (!response.ok()) {
+				// 	return [];
+				// }
+
+				// const json = (await response.json()) as GlobalSearchApiResponse;
+
+				const merchants = await broadSearch();
+
+				async function broadSearch() {
+					const responsePromise = page.waitForResponse((response) =>
+						new URL(response.url()).pathname.endsWith(
+							"search/global"
+						)
 					);
+					// Make the request in browser context
+					const resultPromise = page.evaluate(
+						async ({ term, category }) => {
+							const deviceId =
+								localStorage.getItem("snoonu-app-device-id") ||
+								"web-b741f08b596dfbba55b94f93d08ea032";
+							const token = localStorage.getItem("token") || "";
+
+							const headers = {
+								accept: "*/*",
+								"content-type": "application/json",
+								appversion: "2",
+								language: "en",
+								latitude: "25.30015325558983",
+								longitude: "51.49286493659019",
+								"snoonu-app-device-id": deviceId,
+								"snoonu-app-platform": "Web",
+								"snoonu-app-version": "65535.65535.65535.65535",
+								token: token,
+							};
+
+							const payload: GlobalSearchApiRequestParams = {
+								page: 0,
+								page_size: 20,
+								product_size: 20,
+								term: term,
+								category_id: category,
+							};
+
+							const url = new URL(
+								"https://admin.snoonu.com/api/v5/search/global"
+							);
+							url.search = new URLSearchParams(
+								Object.entries(payload).map(([key, value]) => [
+									key,
+									value.toString(),
+								])
+							).toString();
+
+							const response = await fetch(url.toString(), {
+								headers,
+								mode: "cors",
+								credentials: "omit",
+							});
+
+							if (!response.ok) {
+								console.error(
+									`${response.status}: 📛 Global Search Failed for ${term}`
+								);
+								return [];
+							}
+
+							const json =
+								(await response.json()) as GlobalSearch;
+
+							if (!json.data || !json.is_success) {
+								throw json.error;
+							}
+							return json.data?.merchants ?? [];
+						},
+						{ term, category: SNOONU_CATEGORIES[category] }
+					);
+					const [_, result] = await Promise.all([
+						responsePromise,
+						resultPromise,
+					]);
+					return result;
 				}
-
-				const searchBox = page.locator('input[placeholder*="Search"]');
-				await searchBox.click();
-				await searchBox.fill(term);
-				const [response] = await Promise.all([
-					page.waitForResponse(
-						(resp) =>
-							new URL(resp.url()).pathname.endsWith(
-								"search/global"
-							),
-						{ timeout: 10000 }
-					),
-					await searchBox.press("Enter"),
-				]);
-
-				if (!response.ok()) {
-					return [];
-				}
-
-				const json = (await response.json()) as GlobalSearchApiResponse;
 
 				async function mapMerchant(
 					merchant: GlobalSearchApiMerchant
@@ -1074,14 +1157,15 @@ class SnoonuAutomation {
 					}
 					return {
 						name: merchant.name,
-						url: await page
-							.locator(
-								`a[href*='${merchant.url_friendly_name}']`,
-								{}
-							)
-							.first()
-							.getAttribute("href")
-							.catch(() => null),
+						url: null,
+						// url: await page
+						// 	.locator(
+						// 		`a[href*='${merchant.url_friendly_name}']`,
+						// 		{}
+						// 	)
+						// 	.first()
+						// 	.getAttribute("href")
+						// 	.catch(() => null),
 						distance: merchant.distance,
 						average_preparation_time:
 							merchant.average_preparation_time,
@@ -1090,7 +1174,10 @@ class SnoonuAutomation {
 								.is_free_delivery_eligible,
 						min_eta: merchant.min_eta,
 						rating: merchant.rating,
-						items: merchant.products
+						items: (deepSearch
+							? await merchantDeepSearch(merchant)
+							: await Promise.resolve(merchant.products)
+						)
 							.filter((p) => p.is_instock && p.is_available)
 							.map((item) => ({
 								id: item.product_id,
@@ -1106,7 +1193,7 @@ class SnoonuAutomation {
 										? Number.parseFloat(item.price_old)
 										: null,
 								url: null,
-								relevancy: levenshteinSimilarity(
+								relevance_score: levenshteinSimilarity(
 									item.name,
 									term.toLowerCase()
 								),
@@ -1115,11 +1202,85 @@ class SnoonuAutomation {
 					};
 				}
 
-				const merchants = await Promise.all(
-					json.data.merchants.map(mapMerchant)
-				).then((results) => results.filter((i) => !!i));
+				async function merchantDeepSearch(
+					merchant: GlobalSearchApiMerchant
+				) {
+					const responsePromise = page.waitForResponse((response) =>
+						new URL(response.url()).pathname.endsWith(
+							"/api/search/suggest_in_merchant_with_subcategory"
+						)
+					);
+					const data: SuggestInMerchantRequest = {
+						language: "en",
+						menu_id: merchant.menu_id,
+						term,
+					};
+					// Make the request in browser context
+					const resultPromise = page.evaluate(
+						async ({ data }) => {
+							const deviceId =
+								localStorage.getItem("snoonu-app-device-id") ||
+								"web-b741f08b596dfbba55b94f93d08ea032";
+							const token = localStorage.getItem("token") || "";
+
+							const headers = {
+								accept: "*/*",
+								"content-type": "application/json",
+								appversion: "2",
+								language: "en",
+								latitude: "25.30015325558983",
+								longitude: "51.49286493659019",
+								"snoonu-app-device-id": deviceId,
+								"snoonu-app-platform": "Web",
+								"snoonu-app-version": "65535.65535.65535.65535",
+								token: token,
+							};
+
+							const response = await fetch(
+								"https://admin.snoonu.com/api/search/suggest_in_merchant_with_subcategory",
+								{
+									method: "POST",
+									headers,
+									body: JSON.stringify(data),
+									mode: "cors",
+									credentials: "omit",
+								}
+							);
+
+							if (!response.ok) {
+								console.error(
+									`${response.status}: 📛 SuggestInMerchant Failed for ${merchant.name}`
+								);
+								return [];
+							}
+
+							const json =
+								(await response.json()) as SuggestInMerchantResponse;
+							return json.data?.product_view_models ?? [];
+						},
+						{ data }
+					);
+					const [_, result] = await Promise.all([
+						responsePromise,
+						resultPromise,
+					]);
+					console.log(
+						`🔍 Deep search for ${merchant.name} complete, found ${result.length} items`
+					);
+					return result;
+				}
+
+				const merchant_results = chunkArray(merchants, 5);
+
+				const result: Merchant[] = [];
+				for (const merchant_chunk of merchant_results) {
+					const chunk_results = await Promise.all(
+						merchant_chunk.map(mapMerchant)
+					).then((results) => results.flat().filter((i) => !!i));
+					result.push(...chunk_results);
+				}
 				await page.close();
-				return merchants;
+				return result;
 			}
 		});
 	}
@@ -1242,13 +1403,25 @@ async function main() {
 			return;
 		}
 
-		// const results = await automation.searchProducts([
-		// 	{ term: "gluten free oats", category: "Groceries", amount: "1kg" },
-		// 	{ term: "honey", category: "Groceries", amount: "1kg" },
-		// 	{ term: "carrots", category: "Groceries", amount: "1kg" },
-		// 	{ term: "tomato", category: "Groceries", amount: "1kg" },
-		// 	{ term: "chicken breasts", category: "Groceries", amount: "1kg" },
-		// ]);
+		// const results = await automation.searchProducts(
+		// 	[
+		// 		{
+		// 			term: "gluten free oats",
+		// 			category: "Groceries",
+		// 			amount: "1kg",
+		// 		},
+		// 		{ term: "honey", category: "Groceries", amount: "1kg" },
+		// 		{ term: "carrots", category: "Groceries", amount: "1kg" },
+		// 		{ term: "tomato", category: "Groceries", amount: "1kg" },
+		// 		{
+		// 			term: "chicken breasts",
+		// 			category: "Groceries",
+		// 			amount: "1kg",
+		// 		},
+		// 	],
+		// 	"Everywhere",
+		// 	false
+		// );
 
 		const query = await queryOpenRouter(
 			// `give me a grocery cart for a fodmap diet,
@@ -1288,20 +1461,20 @@ async function main() {
 			}
 		);
 
-		console.table(query.recipes);
+		// console.table(query.recipes);
 
-		// const results = await automation.searchProducts(
-		// 	query.queries.map((q) => ({ ...q, category: "Groceries" }))
-		// );
+		const results = await automation.searchProducts(
+			query.queries.map((q) => ({ ...q, category: "Groceries" }))
+		);
 
-		const results = await automation.searchProducts([
-			{ term: "quinoa", category: "Groceries", amount: "500g" },
-			{ term: "snow peas", category: "Groceries", amount: "500g" },
-			{ term: "asparagus", category: "Groceries", amount: "500g" },
-			{ term: "mushrooms", category: "Groceries", amount: "500g" },
-			{ term: "onions", category: "Groceries", amount: "500g" },
-			{ term: "garlic", category: "Groceries", amount: "500g" },
-		]);
+		// const results = await automation.searchProducts([
+		// 	// { term: "quinoa", category: "Groceries", amount: "500g" },
+		// 	// { term: "snow peas", category: "Groceries", amount: "500g" },
+		// 	// { term: "asparagus", category: "Groceries", amount: "500g" },
+		// 	// { term: "mushrooms", category: "Groceries", amount: "500g" },
+		// 	{ term: "onions", category: "Groceries", amount: "500g" },
+		// 	{ term: "garlic", category: "Groceries", amount: "500g" },
+		// ]);
 
 		const grouped = results.reduce((result, item) => {
 			item.merchants.forEach((merchant) => {
@@ -1321,92 +1494,82 @@ async function main() {
 			return result;
 		}, {} as { [merchant: string]: Pick<Merchant, "items" | "min_eta" | "is_free_delivery_eligible" | "average_preparation_time"> });
 
-		// get first merchant
-		async function filterItemsWithLLM(queries: string[], items: Item[]) {
-			const simplified = {
-				items: items.map((item) => ({
-					id: item.id,
-					name: item.name,
-					description: item.description,
-				})),
-			};
-			const result = await queryOpenRouter(
-				`
-				The user has queries the marketplace AI for the following grocery items:
-				${JSON.stringify(queries, null, 2)}
-
-				We have collected and found the following items in the marketplace:
-				${JSON.stringify(simplified, null, 2)}
-				
-				Please return the product ids of the itmes that are relevant to their grocery list query: ${queries} discard irrelevant items
-				`,
-				object({
-					relevant_items: array(string()),
-				}),
-				{
-					model: "anthropic/claude-sonnet-4.5",
-				}
-			);
-
-			console.log(result);
-			return result;
-		}
-
-		async function chooseItemsWithLLM(
-			queries: {
-				term: string;
-				amount?: number | string;
-				quantity?: number;
-			}[],
-			preferences: string[],
+		async function chooseItemsWithLLM({
+			items,
+			preferences,
+			maxMerchants = 2,
+			minRelevance = 0.2,
+		}: {
 			items: {
-				[merchant: string]: Pick<
-					Merchant,
-					| "items"
-					| "min_eta"
-					| "is_free_delivery_eligible"
-					| "average_preparation_time"
-				>;
-			},
-			maxMerchants: number = 2
-		) {
-			const simplified = Object.entries(items).map(
-				([merchant, data]) => ({
-					merchant,
-					...data,
-					items: data.items
-						.map((item) => ({
-							id: item.id,
-							name: item.name,
-							description: item.description,
-							price: item.price,
-							discounted_price: item.discounted_price,
-						}))
-						.sort((a, b) => a.price - b.price),
-				})
-			);
+				query: {
+					term: string;
+					category?: keyof typeof SNOONU_CATEGORIES;
+					amount?: number | string;
+				};
+				merchants: Merchant[];
+			}[];
+			preferences: string[];
+			maxMerchants?: number;
+			minRelevance?: number;
+		}) {
+			const simplified = Object.entries(items)
+				.map(([_, data]) => ({
+					query: data.query,
+					merchants: data.merchants.map((merchant) => ({
+						merchant,
+						...merchant,
+						items: merchant.items
+							.filter((i) => i.relevance_score > minRelevance)
+							.map((item) => ({
+								id: item.id,
+								name: item.name,
+								price: Math.min(
+									item.price,
+									item.discounted_price ?? 9999999
+								),
+							}))
+							.sort((a, b) => a.price - b.price),
+					})),
+				}))
+				.filter((m) => m.merchants.length > 0);
 			const result = await queryOpenRouter(
 				`
-				The user has queries the marketplace AI for the following grocery items:
-				${JSON.stringify(
-					queries.map(({ term, amount, quantity }) => ({
-						term,
-						amount,
-						quantity,
-					})),
-					null,
-					2
+				The user has queries the marketplace AI for the following grocery items, here are
+				the queries as well as their results (query -[1]-> merchant -[1..*]-> items)
+				${simplified.map(
+					({ query, merchants }) => `
+					query: ${query.term} - ${query.amount}
+				${merchants
+					.map(
+						({ merchant, items }) => `
+					[${merchant.name}]: {
+
+					items: ${items
+						.map(
+							({ id, name, price }) =>
+								`[${id}] ${name} (${price} QR)`
+						)
+						.join(", ")}
+					}
+				`
+					)
+					.join("\n")}
+				`
 				)}
 
-				We have collected and found the following merchants and items the marketplace:
-				${JSON.stringify(simplified)}
-
-				The user has expressed some preferences regarding picking:
+				The user has expressed some preferences regarding picking items:
 				${preferences.map((pref) => `- ${pref}`).join("\n")}
 
-				return the ids for the items to add to cart, the max amount of merchants is ${maxMerchants}
-				Optimize the cart for the least amount of deliveries possible.
-				If more than 2 merchants, get the most items from the cheapest subtotal merchant.
+				# GENERAL RULES:
+				- return the ids for the items to add to cart
+				- the max amount of merchants is ${maxMerchants}
+				- optimize the cart for the least amount of deliveries possible:
+					* for each item, get the exact item, not a similar item.
+					* Note that each merchant delivery costs 10 QAR.
+					* if more than ${maxMerchants} merchants, get the most items from the cheapest subtotal merchant.
+					* if only 1 merchant, get the most items from that merchant.
+					* Do not get duplicate items.
+					* Be smart about the quantities, if user requests 1KG and there's 500g, get 2 items.
 				`,
 				object({
 					notes: string(),
@@ -1416,11 +1579,13 @@ async function main() {
 							relevant_items: array(
 								object({
 									id: string(),
+									name: string(),
 									quantity: number(),
 								})
 							),
 						})
 					),
+					missing: array(string()),
 				}),
 				{
 					model: "google/gemini-2.5-flash",
@@ -1431,15 +1596,11 @@ async function main() {
 			return result;
 		}
 
-		const llm_query = await chooseItemsWithLLM(
-			results.map((item) => item.query),
-			[
-				// "I don't want to buy products that are associated with Israel",
-				// "No NESCAFE",
-				// "multiple of smaller quantity is ok",
-			],
-			grouped
-		);
+		const llm_query = await chooseItemsWithLLM({
+			items: results,
+			maxMerchants: 2,
+			preferences: [],
+		});
 
 		const result: {
 			id: string;
@@ -1481,7 +1642,7 @@ async function main() {
 					quantity: item.quantity,
 				})),
 			};
-			const page = await automation.getPage();
+			const page = automation.getPage();
 			if (page) {
 				const responsePromise = page.waitForResponse((response) =>
 					response.url().includes("/api/v1/multicart/sync")

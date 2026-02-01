@@ -4,7 +4,9 @@ import type { BaseSchema } from "valibot";
 import { parseAsync } from "valibot";
 import { toJsonSchema } from "@valibot/to-json-schema";
 
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_API_KEY =
+	process.env.OPENROUTER_API_KEY ??
+	"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";
 if (!OPENROUTER_API_KEY) {
 	throw new Error("OPENROUTER_API_KEY is not set");
 }

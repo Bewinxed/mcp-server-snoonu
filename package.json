@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "devDependencies": {
+    "@total-typescript/ts-reset": "^0.6.1",
     "@types/bun": "latest",
     "chrome-remote-interface": "^0.33.3",
     "electron": "^38.2.0"
