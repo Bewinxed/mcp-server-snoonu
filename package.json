@@ -3,6 +3,14 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "agent:server": "bun run src/agent/server.ts",
+    "agent:test": "bun run src/agent/test-runner.ts",
+    "ui:dev": "cd snoonu-ui && bun run dev",
+    "ui:build": "cd snoonu-ui && bun run build",
+    "start": "bun run agent:server & bun run ui:dev"
+  },
   "devDependencies": {
     "@total-typescript/ts-reset": "^0.6.1",
     "@types/bun": "latest",
@@ -13,6 +21,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.29",
     "@openrouter/ai-sdk-provider": "^1.2.0",
     "@opentui/core": "^0.1.25",
     "@types/react": "^19.1.14",
@@ -23,6 +32,7 @@
     "playwright": "^1.58.1",
     "react": "^19.1.1",
     "steel-sdk": "^0.16.0",
-    "valibot": "^1.1.0"
+    "valibot": "^1.1.0",
+    "zod": "^4.3.6"
   }
 }
