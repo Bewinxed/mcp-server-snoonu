@@ -32,23 +32,6 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-### Browser Features (Login & Checkout)
-
-Login and checkout require a running Chrome instance with remote debugging. After installing, set up Playwright:
-
-```bash
-npx playwright install chromium
-```
-
-Then launch Chrome with debugging:
-
-```bash
-# macOS
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
-
-# Linux
-google-chrome --remote-debugging-port=9222
-```
 ## Tools
 
 | Tool                   | Description                                                    |
@@ -85,7 +68,7 @@ src/
 ├── lib/
 │   ├── api-client.ts      # Direct fetch() client for Snoonu APIs
 │   ├── session-manager.ts # Cookie/token persistence (~/.mcp-server-snoonu/)
-│   └── browser.ts         # Playwright CDP for login/checkout flows
+│   └── browser.ts         # Playwright browser for login/checkout flows
 └── types/
     └── snoonu/            # TypeScript types for Snoonu API responses
 ```

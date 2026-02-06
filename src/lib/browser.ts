@@ -1,6 +1,6 @@
 /**
  * Browser Layer for Snoonu MCP Server
- * Uses Playwright CDP connection for login/OTP flow and checkout navigation.
+ * Launches a Playwright-managed Chromium instance for login/OTP and checkout.
  *
  * Playwright is lazy-loaded so the bundler doesn't try to inline it
  * and the server starts fast for non-browser operations.
@@ -9,6 +9,7 @@
 import type { Browser, BrowserContext, Page } from "playwright";
 import {
 	updateSessionFromBrowser,
+	loadSession,
 	type CookieData,
 	type SnoonuSession,
 } from "./session-manager";
@@ -18,8 +19,6 @@ let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let page: Page | null = null;
 
-const CDP_ENDPOINT = "http://127.0.0.1:9222";
-
 async function loadPlaywright() {
 	if (chromium) return;
 	try {
@@ -28,35 +27,41 @@ async function loadPlaywright() {
 	} catch {
 		throw new Error(
 			"Playwright is required for browser features (login, checkout).\n" +
-			"Install it with: npm install playwright && npx playwright install chromium"
+			"Install it with: npx playwright install chromium"
 		);
 	}
 }
 
 /**
- * Connect to an existing Chrome instance via CDP.
- * Chrome must be running with --remote-debugging-port=9222
+ * Launch a Playwright-managed Chromium instance.
+ * Restores session cookies if a saved session exists.
  */
 export async function connectBrowser(): Promise<Page> {
 	if (page && !page.isClosed()) return page;
 
 	await loadPlaywright();
 
-	browser = await chromium.connectOverCDP({
-		endpointURL: CDP_ENDPOINT,
-		timeout: 5000,
-	});
+	browser = await chromium.launch({ headless: false });
+	context = await browser.newContext();
 
-	const contexts = browser.contexts();
-	if (contexts.length > 0) {
-		context = contexts[0]!;
-		const pages = context.pages();
-		page = pages.find((p) => p.url().includes("snoonu.com")) || pages[0] || await context.newPage();
-	} else {
-		context = await browser.newContext();
-		page = await context.newPage();
+	// Restore saved session cookies so the browser is already logged in
+	const session = await loadSession();
+	if (session?.cookies?.length) {
+		await context.addCookies(
+			session.cookies.map((c) => ({
+				name: c.name,
+				value: c.value,
+				domain: c.domain,
+				path: c.path,
+				expires: c.expires,
+				httpOnly: c.httpOnly,
+				secure: c.secure,
+				sameSite: c.sameSite,
+			}))
+		);
 	}
 
+	page = await context.newPage();
 	return page;
 }
 
