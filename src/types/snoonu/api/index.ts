@@ -7,6 +7,7 @@ export * from "./suggest-in-merchant";
 export * from "./multicart";
 export * from "./orders";
 export * from "./checkout";
+export * from "./address";
 
 // Re-export request types for convenience
 export type {
@@ -40,3 +41,11 @@ export type {
 	PlaceOrderResponse,
 	PlaceOrderData,
 } from "./checkout";
+
+export type {
+	SavedAddressesResponse,
+	SavedAddress,
+	AddressDetail,
+	TenantInfo,
+	LocationTokenData,
+} from "./address";
