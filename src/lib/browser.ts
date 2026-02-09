@@ -219,6 +219,54 @@ async function extractSessionFromBrowser(p: Page): Promise<SnoonuSession | null>
 }
 
 /**
+ * Sync cart to the Snoonu backend from within the browser context.
+ * This ensures the cart is registered under the browser's cookie session
+ * (which is what the SSR checkout page reads). Without this, the cart
+ * added via Node.js fetch() may not be visible to the checkout page.
+ */
+export async function syncCartViaBrowser(
+	items: Array<{ productId: string; quantity: number }>,
+	headers: Record<string, string>
+): Promise<void> {
+	const p = await connectBrowser();
+
+	if (!p.url().includes("snoonu.com")) {
+		await p.goto("https://snoonu.com", { waitUntil: "domcontentloaded" });
+	}
+
+	await p.evaluate(
+		async ({ apiUrl, hdrs, syncItems }) => {
+			await fetch(apiUrl, {
+				method: "POST",
+				headers: hdrs,
+				body: JSON.stringify({
+					items: syncItems.map((item: any) => ({
+						product_identity: {
+							product_id: item.productId,
+							choice_item_ids: [],
+							special_request: "",
+						},
+						quantity: item.quantity,
+					})),
+				}),
+				credentials: "omit",
+			});
+			// Also fire orders/open to activate cart server-side
+			fetch(hdrs._ordersOpenUrl || "", {
+				headers: hdrs,
+				method: "GET",
+				credentials: "omit",
+			}).catch(() => {});
+		},
+		{
+			apiUrl: "https://snoomarket-web.snoonu.com/api/v1/multicart/sync",
+			hdrs: { ...headers, _ordersOpenUrl: "https://admin.snoonu.com/api/v5/orders/open" },
+			syncItems: items,
+		}
+	);
+}
+
+/**
  * Navigate to checkout page.
  */
 export async function goToCheckout(): Promise<{

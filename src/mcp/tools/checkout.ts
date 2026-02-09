@@ -6,8 +6,8 @@
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { isAuthenticated } from "../../lib/session-manager";
-import { goToCheckout, syncCartToLocalStorage } from "../../lib/browser";
+import { isAuthenticated, getApiHeaders } from "../../lib/session-manager";
+import { goToCheckout, syncCartViaBrowser, syncCartToLocalStorage } from "../../lib/browser";
 import { getCart } from "../../lib/api-client";
 
 export function registerCheckoutTools(server: McpServer) {
@@ -52,8 +52,14 @@ If the cart is empty, returns an error suggesting add_to_cart. Call get_cart fir
 				};
 			}
 
-			// Sync API cart state → browser localStorage so the Next.js
-			// checkout page sees the correct items when it loads.
+			// Sync cart to browser: (1) replay the multicart/sync API call
+			// from within the browser so the SSR checkout page sees the items,
+			// (2) write to localStorage for the Next.js frontend hydration.
+			const headers = getApiHeaders();
+			await syncCartViaBrowser(
+				cart.items.map((i) => ({ productId: i.productId, quantity: i.quantity })),
+				headers
+			);
 			await syncCartToLocalStorage(cart.items);
 
 			const result = await goToCheckout();
