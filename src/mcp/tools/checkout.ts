@@ -5,13 +5,13 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { isAuthenticated } from "../../lib/session-manager";
-import { goToCheckout } from "../../lib/browser";
+import { goToCheckout, syncCartToLocalStorage } from "../../lib/browser";
 import { getCart } from "../../lib/api-client";
 
 export function registerCheckoutTools(server: McpServer) {
 	server.tool(
 		"go_to_checkout",
-		"Navigate the browser to the Snoonu checkout page. Does NOT place the order — just opens checkout for the user to review and complete. Requires login and a browser with Chrome running.",
+		"Navigate the browser to the Snoonu checkout page. Does NOT place the order — just opens checkout for the user to review and complete. Requires login.",
 		{},
 		async () => {
 			if (!isAuthenticated()) {
@@ -45,6 +45,10 @@ export function registerCheckoutTools(server: McpServer) {
 					],
 				};
 			}
+
+			// Sync API cart state → browser localStorage so the Next.js
+			// checkout page sees the correct items when it loads.
+			await syncCartToLocalStorage(cart.items);
 
 			const result = await goToCheckout();
 

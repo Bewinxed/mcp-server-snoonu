@@ -75,7 +75,8 @@ export function registerSearchTools(server: McpServer) {
 	// ── search_products ────────────────────────────────────────────────
 	server.tool(
 		"search_products",
-		`Search for products across all Snoonu merchants. Start here.
+		`Search for products across all Snoonu merchants. Use for single-item searches.
+For multiple items at once (e.g. grocery lists), use bulk_search instead.
 
 Returns merchant summaries and the cheapest matching products globally.
 Use search_in_merchant to drill into a specific merchant's full catalog.
