@@ -4,7 +4,8 @@
   "description": "MCP server for Snoonu (Qatar delivery) — search, cart, checkout, auth",
   "type": "module",
   "bin": {
-    "mcp-server-snoonu": "dist/server.mjs"
+    "mcp-server-snoonu": "dist/server.mjs",
+    "mcp-server-snoonu-http": "dist/server-http.mjs"
   },
   "files": [
     "dist",
@@ -14,6 +15,7 @@
   "scripts": {
     "build": "tsdown",
     "dev": "bun run src/mcp/server.ts",
+    "dev:http": "bun run src/mcp/server-http.ts",
     "prepublishOnly": "bun run build"
   },
   "keywords": [

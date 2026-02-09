@@ -1,9 +1,6 @@
 /**
  * Snoonu Shopping MCP Server (stdio)
  *
- * A standard MCP server using @modelcontextprotocol/sdk that exposes
- * Snoonu shopping tools: search, cart, checkout, and auth.
- *
  * Usage:
  *   npx mcp-server-snoonu
  *   bun run src/mcp/server.ts
@@ -12,30 +9,15 @@
  *   claude mcp add snoonu -- npx -y mcp-server-snoonu
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-	registerSessionTools,
-	registerSearchTools,
-	registerCartTools,
-	registerCheckoutTools,
-	registerBrowseTools,
-	registerLocationTools,
-} from "./tools/index";
+import { createSnoonuServer } from "./create-server";
 
-const server = new McpServer({
-	name: "mcp-server-snoonu",
-	version: "0.1.0",
-});
-
-// Register all tools
-registerSessionTools(server);
-registerSearchTools(server);
-registerCartTools(server);
-registerCheckoutTools(server);
-registerBrowseTools(server);
-registerLocationTools(server);
-
-// Start stdio transport
+const server = createSnoonuServer();
 const transport = new StdioServerTransport();
+
+process.stdin.resume();
+
 await server.connect(transport);
+
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));

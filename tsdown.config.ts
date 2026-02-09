@@ -1,7 +1,7 @@
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
-  entry: ["src/mcp/server.ts"],
+  entry: ["src/mcp/server.ts", "src/mcp/server-http.ts"],
   format: "esm",
   target: "node18",
   platform: "node",
