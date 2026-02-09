@@ -15,7 +15,9 @@ import { syncLocationToBrowser } from "../../lib/browser";
 export function registerLocationTools(server: McpServer) {
 	server.tool(
 		"get_saved_addresses",
-		"Get saved delivery addresses. Returns id, label, and address. Use the id with set_delivery_location to change delivery location.",
+		`List all saved delivery addresses for the logged-in user. Returns each address's id, label (e.g. "Home", "Office"), and full address string, plus the currently active delivery location.
+
+Requires login. Use the address id with set_delivery_location to switch where deliveries go. Changing location affects which merchants are available, delivery fees, and ETAs for all subsequent search and cart operations.`,
 		{},
 		async () => {
 			if (!isAuthenticated()) {
@@ -70,11 +72,15 @@ export function registerLocationTools(server: McpServer) {
 
 	server.tool(
 		"set_delivery_location",
-		"Set delivery location by address ID (from get_saved_addresses). Changes available merchants, delivery fees, and ETAs for all subsequent operations.",
+		`Switch the active delivery location to a saved address. This changes which merchants are available, delivery fees, ETAs, and product availability for ALL subsequent operations (search, cart, checkout).
+
+Requires login. The address_id must come from a previous get_saved_addresses call. Updates the session's coordinates on disk and syncs the location to the browser cookie so the Snoonu website reflects the change.
+
+Call get_saved_addresses first to show the user their options, then use this tool with their chosen address id.`,
 		{
 			address_id: z
 				.number()
-				.describe("Address ID from get_saved_addresses"),
+				.describe("Numeric address ID from a previous get_saved_addresses result, e.g. 12345"),
 		},
 		async ({ address_id }) => {
 			if (!isAuthenticated()) {

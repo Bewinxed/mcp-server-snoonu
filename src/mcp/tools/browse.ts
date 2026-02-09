@@ -9,7 +9,9 @@ import { SNOONU_CATEGORIES } from "../../lib/api-client";
 export function registerBrowseTools(server: McpServer) {
 	server.tool(
 		"browse_categories",
-		"List available Snoonu categories for searching. Returns category names and their IDs.",
+		`List all available Snoonu product categories and their internal IDs. Categories include Groceries, Restaurants, Pharmacy, Market, and Flowers. Does not require login.
+
+Use the category name (not the ID) as the "category" parameter in search_products or bulk_search to filter results. Default category is Groceries if not specified.`,
 		{},
 		async () => {
 			const categories = Object.entries(SNOONU_CATEGORIES).map(

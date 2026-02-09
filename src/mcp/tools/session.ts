@@ -18,7 +18,11 @@ import {
 export function registerSessionTools(server: McpServer) {
 	server.tool(
 		"init_session",
-		"Initialize Snoonu shopping session. Loads saved auth from disk and checks if user is logged in. Call this first before any other tool.",
+		`Initialize or restore a Snoonu shopping session. Loads previously saved authentication credentials from disk (~/.mcp-server-snoonu/session.json) and checks whether the user is already logged in.
+
+Call this FIRST before any other tool — it hydrates cookies, device ID, and delivery location so that search, cart, and checkout tools work correctly.
+
+Returns: logged_in status, device_id, whether a delivery location is set, and when the session was last saved. If not logged in, the next step is to call login with the user's phone number.`,
 		{},
 		async () => {
 			const session = await loadSession();
@@ -46,12 +50,16 @@ export function registerSessionTools(server: McpServer) {
 
 	server.tool(
 		"login",
-		"Start OTP login flow. Opens browser, navigates to snoonu.com, enters phone number, and triggers OTP. After calling this, ask the user for the 6-digit OTP code they received, then call verify_otp.",
+		`Start the OTP login flow for Snoonu. Launches a headless Chromium browser, navigates to snoonu.com, enters the provided phone number, and requests a one-time password (OTP).
+
+After calling this tool, you MUST ask the user for the 6-digit OTP code they received via SMS, then call verify_otp to complete login. Do not call any cart or checkout tools until login is complete.
+
+This tool will fail if the user is already logged in — call logout first to switch accounts. Requires a working internet connection and Playwright/Chromium installed.`,
 		{
 			phone_number: z
 				.string()
 				.describe(
-					"Phone number without country code (e.g., '55123456' for Qatar +974)"
+					"Phone number without country code, e.g. '55123456' for a Qatar (+974) number"
 				),
 		},
 		async ({ phone_number }) => {
@@ -91,11 +99,13 @@ export function registerSessionTools(server: McpServer) {
 
 	server.tool(
 		"verify_otp",
-		"Complete login by entering OTP code. Call this after `login` with the 6-digit code the user received.",
+		`Complete the Snoonu login by submitting the 6-digit OTP code the user received via SMS. Must be called after login — calling it without a prior login will fail.
+
+On success, the session (cookies, auth token, device ID) is persisted to disk so future init_session calls restore it automatically. Returns whether login succeeded and the user's logged-in state.`,
 		{
 			otp_code: z
 				.string()
-				.describe("6-digit OTP code received by the user"),
+				.describe("The 6-digit numeric OTP code the user received via SMS, e.g. '123456'"),
 		},
 		async ({ otp_code }) => {
 			const result = await verifyOtp(otp_code);
@@ -117,7 +127,9 @@ export function registerSessionTools(server: McpServer) {
 
 	server.tool(
 		"logout",
-		"Clear saved session and log out.",
+		`Clear the current Snoonu session and log out. Deletes saved cookies, auth token, and device ID from disk. After calling this, the user must log in again with login + verify_otp to use cart or checkout tools.
+
+Use this when the user wants to switch accounts or explicitly log out. Search and browse tools will continue to work without login, but cart and checkout will not.`,
 		{},
 		async () => {
 			await clearSession();

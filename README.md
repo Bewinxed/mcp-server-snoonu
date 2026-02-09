@@ -44,9 +44,10 @@ Add to your `claude_desktop_config.json`:
 | `verify_otp`           | Complete login with the 6-digit OTP code                       |
 | `logout`               | Clear the current session                                      |
 | `search_products`      | Search across merchants (supports `deep_search` for full catalogs) |
+| `bulk_search`          | Search multiple products at once in parallel (great for grocery lists) |
 | `search_in_merchant`   | Search within a specific merchant by menu ID                   |
 | `get_product_details`  | Get images, descriptions, and stock info for a product         |
-| `browse_categories`    | List top-level categories (Groceries, Food, etc.)              |
+| `browse_categories`    | List top-level categories (Groceries, Restaurants, etc.)       |
 | `get_saved_addresses`  | List saved delivery addresses                                  |
 | `set_delivery_location`| Switch delivery location by address ID                         |
 | `add_to_cart`          | Add items to cart (requires login)                             |
@@ -60,10 +61,12 @@ Add to your `claude_desktop_config.json`:
 ```text
 src/
 ├── mcp/
-│   ├── server.ts          # MCP server entry point (stdio)
+│   ├── server.ts          # Stdio entry point (local use via npx/bunx)
+│   ├── server-http.ts     # HTTP entry point (remote/Docker deployment)
+│   ├── create-server.ts   # Shared server factory
 │   └── tools/             # Tool definitions (Zod schemas + handlers)
 │       ├── session.ts     # init_session, login, verify_otp, logout
-│       ├── search.ts      # search_products, search_in_merchant
+│       ├── search.ts      # search_products, bulk_search, search_in_merchant, get_product_details
 │       ├── cart.ts        # add_to_cart, get_cart, remove_from_cart, clear_cart
 │       ├── checkout.ts    # go_to_checkout
 │       ├── browse.ts      # browse_categories
@@ -96,3 +99,6 @@ bun run build
 ## License
 
 [MIT](LICENSE)
+
+> [!NOTE]
+> **Disclaimer:** This project is not affiliated with, endorsed by, or sponsored by Snoonu or any of its subsidiaries. "Snoonu" is a trademark of Snoonu W.L.L. This is an independent, open-source tool that interacts with publicly available Snoonu web APIs. Use at your own risk and in accordance with Snoonu's terms of service.

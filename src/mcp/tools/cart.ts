@@ -33,7 +33,11 @@ function authError(action: string) {
 export function registerCartTools(server: McpServer) {
 	server.tool(
 		"add_to_cart",
-		"Add one or more products to the shopping cart. Use product_id from search results. Requires login. Returns summary — use get_cart for full listing.",
+		`Add one or more products to the Snoonu shopping cart. Accepts an array of {product_id, quantity} objects — use the product_id values from search_products, bulk_search, or search_in_merchant results.
+
+Requires login (call init_session + login + verify_otp first). Syncs the cart both server-side (via the multicart API) and to the browser's localStorage so the Snoonu checkout page reflects changes immediately.
+
+Returns a summary with items added, cart total, and item count. Use get_cart for the full item listing with per-item details. All items must be from merchants available at the current delivery location.`,
 		{
 			items: z
 				.array(
@@ -78,7 +82,9 @@ export function registerCartTools(server: McpServer) {
 
 	server.tool(
 		"get_cart",
-		"Get current shopping cart contents. Shows all items, quantities, and prices.",
+		`Retrieve the current shopping cart contents from the Snoonu API. Returns each item's product_id, name, quantity, unit price, and line total, plus the cart subtotal and total item count.
+
+Does not require login, but returns an empty cart if the user is not authenticated. Use this to show the user what's in their cart before proceeding to go_to_checkout.`,
 		{},
 		async () => {
 			const cart = await getCart();
@@ -121,11 +127,13 @@ export function registerCartTools(server: McpServer) {
 
 	server.tool(
 		"remove_from_cart",
-		"Remove an item from the cart. Returns updated summary — use get_cart for full listing.",
+		`Remove a single product from the shopping cart entirely (sets its quantity to 0). Requires login. Syncs the change to both the server-side cart and the browser's localStorage.
+
+Returns an updated summary with the new cart total and item count. To remove all items at once, use clear_cart instead. To change quantity without removing, use add_to_cart with the desired quantity.`,
 		{
 			product_id: z
 				.string()
-				.describe("Product ID to remove from cart"),
+				.describe("The product_id of the item to remove, from a previous get_cart or add_to_cart result"),
 		},
 		async ({ product_id }) => {
 			if (!isAuthenticated()) return authError("modify cart");
@@ -153,7 +161,9 @@ export function registerCartTools(server: McpServer) {
 
 	server.tool(
 		"clear_cart",
-		"Remove all items from the cart.",
+		`Remove ALL items from the shopping cart at once. This is a destructive operation — all items are set to quantity 0 and the cart is emptied. Requires login.
+
+Use this when the user wants to start fresh or discard their current cart. To remove a single item, use remove_from_cart instead.`,
 		{},
 		async () => {
 			if (!isAuthenticated()) return authError("clear cart");

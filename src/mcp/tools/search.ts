@@ -75,18 +75,17 @@ export function registerSearchTools(server: McpServer) {
 	// ── search_products ────────────────────────────────────────────────
 	server.tool(
 		"search_products",
-		`Search for products across all Snoonu merchants. Use for single-item searches.
-For multiple items at once (e.g. grocery lists), use bulk_search instead.
+		`Search for products across all open Snoonu merchants. Best for single-item queries like "milk" or "chicken breast". For grocery lists with multiple items, use bulk_search instead — it runs queries in parallel and is much faster.
 
-Returns merchant summaries and the cheapest matching products globally.
-Use search_in_merchant to drill into a specific merchant's full catalog.
-Use get_product_details for images, descriptions, and stock info.
+Returns two things: (1) merchant summaries with name, ETA, rating, delivery info, and price range; (2) the cheapest matching products across all merchants, sorted by price. Does not require login — works for anonymous browsing.
 
-response_format controls verbosity:
-  "concise" (default) — merchant summaries + top N cheapest globally. Lowest token cost.
-  "detailed" — includes per-merchant product lists for side-by-side comparison.
+Use response_format to control token cost:
+  - "concise" (default): merchant summaries + top cheapest products globally. ~65% fewer tokens.
+  - "detailed": includes per-merchant product lists for side-by-side price comparison.
 
-deep_search fans out into each merchant for comprehensive catalogs (slower).`,
+Set deep_search=true to fan out into each merchant's full catalog via search_in_merchant. This is slower (one extra API call per merchant) but finds products that the global search may miss.
+
+Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) to see a specific merchant's full results, or get_product_details(product_id) for images, stock count, and descriptions.`,
 		{
 			query: z
 				.string()
@@ -267,15 +266,13 @@ deep_search fans out into each merchant for comprehensive catalogs (slower).`,
 	// ── bulk_search ───────────────────────────────────────────────────
 	server.tool(
 		"bulk_search",
-		`Search for multiple products at once. Runs all queries in parallel.
+		`Search for multiple products at once, running all queries in parallel. Use this instead of calling search_products repeatedly — it is significantly faster for grocery lists or multi-item requests.
 
-Returns the top results per query from multiple merchants so you can compare prices,
-ETAs, and pick the best option for each item.
+For each query, returns the top results across all open merchants sorted by price, including merchant name, ETA, and free delivery status so you can compare options and recommend the best one. Example input: ["milk", "eggs", "bread", "chicken breast"].
 
-Great for grocery lists — e.g. ["milk", "eggs", "bread", "chicken breast"].
+Optionally pass merchant_ids to restrict results to specific stores (useful after an initial search_products identifies preferred merchants). Set deep_search=true to fan out into each merchant per query for comprehensive results — slower but finds items the global search may miss.
 
-Optionally restrict to specific merchants (merchant_ids) to compare within known stores.
-deep_search fans out into each merchant per query for comprehensive results (slower but finds more).`,
+Does not require login. Returns up to top_k results per query (default 5). Use get_product_details(product_id) on any result for images, stock, and descriptions.`,
 		{
 			queries: z
 				.array(z.string())
@@ -433,10 +430,11 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 	// ── search_in_merchant ─────────────────────────────────────────────
 	server.tool(
 		"search_in_merchant",
-		`Search within a specific merchant's catalog. Use merchant_id and menu_id from search_products results.
+		`Search within a single merchant's full catalog. Use the merchant_id and menu_id values from a previous search_products or bulk_search result.
 
-Returns compact product list (id, name, price, discount if applicable).
-Use get_product_details(product_id) for images, descriptions, and stock info.`,
+Returns a compact list of matching products (id, name, price, discount) from that merchant only. This is more thorough than the global search for a specific store — it queries the merchant's own search index and often returns products that search_products missed.
+
+Does not require login. Use get_product_details(product_id) on any result for images, descriptions, and stock info.`,
 		{
 			merchant_id: z
 				.number()
@@ -490,9 +488,11 @@ Use get_product_details(product_id) for images, descriptions, and stock info.`,
 	// ── get_product_details ────────────────────────────────────────────
 	server.tool(
 		"get_product_details",
-		`Get full details for a product by ID. Returns image URL, description, stock count, discount info.
+		`Get full details for a single product by its product_id. Returns image URL, description, stock count, original price, discount percentage, and availability — fields that are omitted from search results to save tokens.
 
-Product must have appeared in a previous search_products or search_in_merchant call (cached in memory).`,
+The product must have appeared in a previous search_products, bulk_search, or search_in_merchant call during this session (results are cached in memory). If the product is not in cache, you will get an error asking you to search for it first.
+
+Use this when the user wants to see what a product looks like, check if it's in stock, or read its description before adding to cart.`,
 		{
 			product_id: z
 				.string()

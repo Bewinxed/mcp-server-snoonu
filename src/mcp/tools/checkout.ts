@@ -11,7 +11,11 @@ import { getCart } from "../../lib/api-client";
 export function registerCheckoutTools(server: McpServer) {
 	server.tool(
 		"go_to_checkout",
-		"Navigate the browser to the Snoonu checkout page. Does NOT place the order — just opens checkout for the user to review and complete. Requires login.",
+		`Open the Snoonu checkout page in the browser so the user can review and complete their order. Does NOT place the order automatically — the user must confirm payment and delivery details themselves.
+
+Requires login and a non-empty cart. Before navigating, this tool syncs the current API cart state to the browser's localStorage so the checkout page displays the correct items. Returns the checkout URL and a cart summary (items, quantities, subtotal).
+
+If the cart is empty, returns an error suggesting add_to_cart. Call get_cart first if you want to show the user their cart contents before proceeding to checkout.`,
 		{},
 		async () => {
 			if (!isAuthenticated()) {
