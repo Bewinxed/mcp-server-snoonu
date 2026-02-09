@@ -263,6 +263,153 @@ deep_search fans out into each merchant for comprehensive catalogs (slower).`,
 		},
 	);
 
+	// ── bulk_search ───────────────────────────────────────────────────
+	server.tool(
+		"bulk_search",
+		`Search for multiple products at once. Runs all queries in parallel and returns
+the cheapest option per query across all merchants.
+
+Great for grocery lists — e.g. ["milk", "eggs", "bread", "chicken breast"].
+
+deep_search fans out into each merchant per query for comprehensive results (slower but finds more).`,
+		{
+			queries: z
+				.array(z.string())
+				.min(1)
+				.max(20)
+				.describe(
+					'List of search terms (e.g. ["milk", "eggs", "bread"])',
+				),
+			category: z
+				.enum([
+					"Groceries",
+					"Restaurants",
+					"Pharmacy",
+					"Market",
+					"Flowers",
+				])
+				.optional()
+				.describe("Product category for all queries (default: Groceries)"),
+			deep_search: z
+				.boolean()
+				.optional()
+				.describe(
+					"Fan out into each merchant per query. Slower but finds cheaper options. (default: false)",
+				),
+			limit: z
+				.number()
+				.optional()
+				.describe("Max products per merchant per query (default: 3)"),
+		},
+		async ({ queries, category, deep_search, limit }) => {
+			const cat = (category as CategoryName) || "Groceries";
+			const lim = limit || 3;
+
+			const queryResults = await chunkParallel(
+				queries,
+				5,
+				async (query) => {
+					try {
+						const result = await searchProducts(query, {
+							category: cat,
+							productSize: lim,
+						});
+
+						let openMerchants = result.merchants.filter(
+							(m) => m.isOpen,
+						);
+
+						if (deep_search && openMerchants.length > 0) {
+							openMerchants = await chunkParallel(
+								openMerchants,
+								5,
+								async (merchant) => {
+									try {
+										const deepProducts =
+											await searchInMerchant(
+												merchant.id,
+												merchant.menuId,
+												query,
+											);
+										return {
+											...merchant,
+											products:
+												deepProducts.length > 0
+													? deepProducts
+													: merchant.products,
+										};
+									} catch {
+										return merchant;
+									}
+								},
+							);
+						}
+
+						for (const m of openMerchants) cacheProducts(m);
+
+						const seen = new Set<string>();
+						const cheapest = openMerchants
+							.flatMap((m) =>
+								m.products.slice(0, lim).map((p) => ({
+									id: p.productId,
+									name: p.name,
+									price: p.price,
+									merchant: m.name,
+									merchant_id: m.id,
+									menu_id: m.menuId,
+									...(p.discountPercentage
+										? { discount: p.discountPercentage }
+										: {}),
+								})),
+							)
+							.filter((p) => {
+								if (seen.has(p.id)) return false;
+								seen.add(p.id);
+								return true;
+							})
+							.sort((a, b) => a.price - b.price)
+							.slice(0, lim);
+
+						return {
+							query,
+							found: cheapest.length,
+							cheapest,
+						};
+					} catch (err) {
+						return {
+							query,
+							found: 0,
+							cheapest: [],
+							error:
+								err instanceof Error
+									? err.message
+									: String(err),
+						};
+					}
+				},
+			);
+
+			const totalFound = queryResults.reduce(
+				(sum, r) => sum + r.found,
+				0,
+			);
+
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify({
+							queries: queries.length,
+							total_found: totalFound,
+							results: queryResults,
+							hint: "Use get_product_details(id) for images/stock. Use search_in_merchant for more options from a specific store.",
+						}),
+					},
+				],
+			};
+		},
+	);
+
 	// ── search_in_merchant ─────────────────────────────────────────────
 	server.tool(
 		"search_in_merchant",

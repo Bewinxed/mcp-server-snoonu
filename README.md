@@ -3,6 +3,9 @@
 [![npm version](https://img.shields.io/npm/v/mcp-server-snoonu.svg)](https://www.npmjs.com/package/mcp-server-snoonu)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Bewinxed/mcp-server-snoonu/blob/main/LICENSE)
 
+> [!IMPORTANT]
+> **Your credentials never leave your machine.** All authentication (OTP login, session cookies) is handled locally via a browser on your device. Session data is stored at `~/.mcp-server-snoonu/session.json` on your filesystem only — no tokens or passwords are ever sent to or stored on any remote server.
+
 A Model Context Protocol (MCP) server for shopping on [Snoonu](https://snoonu.com) — Qatar's delivery platform. Search products, manage your cart, and checkout — all from any MCP-compatible agent.
 
 ## Quick Start
