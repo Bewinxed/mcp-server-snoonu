@@ -266,11 +266,14 @@ deep_search fans out into each merchant for comprehensive catalogs (slower).`,
 	// ── bulk_search ───────────────────────────────────────────────────
 	server.tool(
 		"bulk_search",
-		`Search for multiple products at once. Runs all queries in parallel and returns
-the cheapest option per query across all merchants.
+		`Search for multiple products at once. Runs all queries in parallel.
+
+Returns the top results per query from multiple merchants so you can compare prices,
+ETAs, and pick the best option for each item.
 
 Great for grocery lists — e.g. ["milk", "eggs", "bread", "chicken breast"].
 
+Optionally restrict to specific merchants (merchant_ids) to compare within known stores.
 deep_search fans out into each merchant per query for comprehensive results (slower but finds more).`,
 		{
 			queries: z
@@ -290,20 +293,31 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 				])
 				.optional()
 				.describe("Product category for all queries (default: Groceries)"),
+			merchant_ids: z
+				.array(z.number())
+				.optional()
+				.describe(
+					"Filter to specific merchant IDs (from previous search_products results). If omitted, searches all merchants.",
+				),
 			deep_search: z
 				.boolean()
 				.optional()
 				.describe(
-					"Fan out into each merchant per query. Slower but finds cheaper options. (default: false)",
+					"Fan out into each merchant per query. Slower but finds more options. (default: false)",
 				),
-			limit: z
+			top_k: z
 				.number()
 				.optional()
-				.describe("Max products per merchant per query (default: 3)"),
+				.describe(
+					"Number of top results to return per query across all merchants (default: 5)",
+				),
 		},
-		async ({ queries, category, deep_search, limit }) => {
+		async ({ queries, category, deep_search, top_k, merchant_ids }) => {
 			const cat = (category as CategoryName) || "Groceries";
-			const lim = limit || 3;
+			const topK = top_k || 5;
+			const merchantFilter = merchant_ids
+				? new Set(merchant_ids)
+				: null;
 
 			const queryResults = await chunkParallel(
 				queries,
@@ -312,11 +326,13 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 					try {
 						const result = await searchProducts(query, {
 							category: cat,
-							productSize: lim,
+							productSize: topK,
 						});
 
 						let openMerchants = result.merchants.filter(
-							(m) => m.isOpen,
+							(m) =>
+								m.isOpen &&
+								(!merchantFilter || merchantFilter.has(m.id)),
 						);
 
 						if (deep_search && openMerchants.length > 0) {
@@ -347,16 +363,19 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 
 						for (const m of openMerchants) cacheProducts(m);
 
+						// Collect all products with merchant context, dedup by productId
 						const seen = new Set<string>();
-						const cheapest = openMerchants
+						const options = openMerchants
 							.flatMap((m) =>
-								m.products.slice(0, lim).map((p) => ({
+								m.products.map((p) => ({
 									id: p.productId,
 									name: p.name,
 									price: p.price,
 									merchant: m.name,
 									merchant_id: m.id,
 									menu_id: m.menuId,
+									eta: m.minEta,
+									free_delivery: m.isFreeDeliveryEligible,
 									...(p.discountPercentage
 										? { discount: p.discountPercentage }
 										: {}),
@@ -368,18 +387,18 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 								return true;
 							})
 							.sort((a, b) => a.price - b.price)
-							.slice(0, lim);
+							.slice(0, topK);
 
 						return {
 							query,
-							found: cheapest.length,
-							cheapest,
+							found: options.length,
+							options,
 						};
 					} catch (err) {
 						return {
 							query,
 							found: 0,
-							cheapest: [],
+							options: [],
 							error:
 								err instanceof Error
 									? err.message
@@ -402,7 +421,7 @@ deep_search fans out into each merchant per query for comprehensive results (slo
 							queries: queries.length,
 							total_found: totalFound,
 							results: queryResults,
-							hint: "Use get_product_details(id) for images/stock. Use search_in_merchant for more options from a specific store.",
+							hint: "Compare options per query — pick by price, ETA, or merchant preference. Use get_product_details(id) for images/stock.",
 						}),
 					},
 				],
