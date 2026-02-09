@@ -45,9 +45,18 @@ export async function connectBrowser(): Promise<Page> {
 
 	await loadPlaywright();
 
-	browser = await chromiumExtra.launch({
-		headless: process.env.HEADLESS !== "false",
-	});
+	try {
+		browser = await chromiumExtra.launch({
+			headless: process.env.HEADLESS !== "false",
+		});
+	} catch (err: any) {
+		if (err?.message?.includes("Executable doesn't exist")) {
+			throw new Error(
+				"Chromium browser is not installed. Run this command to install it: npx playwright install chromium — then retry the operation."
+			);
+		}
+		throw err;
+	}
 	context = await browser.newContext();
 
 	// Restore saved session cookies so the browser is already logged in
