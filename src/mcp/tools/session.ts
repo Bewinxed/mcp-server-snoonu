@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Session MCP Tools
  * init_session, login, verify_otp, logout

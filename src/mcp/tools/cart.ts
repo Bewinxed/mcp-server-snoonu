@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Cart MCP Tools
  * add_to_cart, get_cart, remove_from_cart, clear_cart

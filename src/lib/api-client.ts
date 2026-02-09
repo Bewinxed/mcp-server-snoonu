@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Direct HTTP API Client for Snoonu
  * Makes fetch() calls with auth headers — no browser needed.

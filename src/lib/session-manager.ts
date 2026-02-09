@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Session Manager for Snoonu MCP Server
  * Persists auth cookies, deviceId, and location to disk.

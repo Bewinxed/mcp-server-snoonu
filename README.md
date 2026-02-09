@@ -1,7 +1,7 @@
 # mcp-server-snoonu
 
 [![npm version](https://img.shields.io/npm/v/mcp-server-snoonu.svg)](https://www.npmjs.com/package/mcp-server-snoonu)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Bewinxed/mcp-server-snoonu/blob/main/LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://github.com/Bewinxed/mcp-server-snoonu/blob/main/LICENSE)
 
 > [!IMPORTANT]
 > **Your credentials never leave your machine.** All authentication (OTP login, session cookies) is handled locally via a browser on your device. Session data is stored at `~/.mcp-server-snoonu/session.json` on your filesystem only — no tokens or passwords are ever sent to or stored on any remote server.
@@ -98,7 +98,7 @@ bun run build
 
 ## License
 
-[MIT](LICENSE)
+[AGPL-3.0](LICENSE) — Copyright (c) 2025 Omar Al Matar
 
 > [!NOTE]
 > **Disclaimer:** This project is not affiliated with, endorsed by, or sponsored by Snoonu or any of its subsidiaries. "Snoonu" is a trademark of Snoonu W.L.L. This is an independent, open-source tool that interacts with publicly available Snoonu web APIs. Use at your own risk and in accordance with Snoonu's terms of service.

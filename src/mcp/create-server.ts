@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Shared MCP server factory.
  * Creates and configures an McpServer with all Snoonu tools registered.

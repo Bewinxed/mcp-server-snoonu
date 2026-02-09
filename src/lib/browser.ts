@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Omar Al Matar — SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Browser Layer for Snoonu MCP Server
  * Launches a Playwright-managed Chromium instance for login/OTP and checkout.
