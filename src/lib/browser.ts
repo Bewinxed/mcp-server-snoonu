@@ -14,16 +14,18 @@ import {
 	type SnoonuSession,
 } from "./session-manager";
 
-let chromium: typeof import("playwright").chromium;
+let chromiumExtra: any;
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let page: Page | null = null;
 
 async function loadPlaywright() {
-	if (chromium) return;
+	if (chromiumExtra) return;
 	try {
-		const pw = await import("playwright");
-		chromium = pw.chromium;
+		const { chromium } = await import("playwright-extra");
+		const StealthPlugin = (await import("puppeteer-extra-plugin-stealth")).default;
+		chromium.use(StealthPlugin());
+		chromiumExtra = chromium;
 	} catch {
 		throw new Error(
 			"Playwright is required for browser features (login, checkout).\n" +
@@ -41,7 +43,9 @@ export async function connectBrowser(): Promise<Page> {
 
 	await loadPlaywright();
 
-	browser = await chromium.launch({ headless: false });
+	browser = await chromiumExtra.launch({
+		headless: process.env.HEADLESS !== "false",
+	});
 	context = await browser.newContext();
 
 	// Restore saved session cookies so the browser is already logged in

@@ -5,7 +5,7 @@ export default defineConfig({
   format: "esm",
   target: "node18",
   platform: "node",
-  external: ["@modelcontextprotocol/sdk", "zod", "playwright"],
+  external: ["@modelcontextprotocol/sdk", "zod", "playwright", "playwright-extra", "puppeteer-extra-plugin-stealth"],
   banner: { js: "#!/usr/bin/env node" },
   clean: true,
 });
