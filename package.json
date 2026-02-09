@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-snoonu",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for Snoonu (Qatar delivery) — search, cart, checkout, auth",
   "type": "module",
   "bin": {
