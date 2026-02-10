@@ -461,6 +461,146 @@ export async function syncLocationToBrowser(
 }
 
 /**
+ * Scrape payment methods from the checkout page.
+ * Reads the radiogroup[name="paymentMethod"] inputs.
+ */
+export async function getPaymentMethods(): Promise<{
+	success: boolean;
+	methods: Array<{ index: number; value: string; label: string; selected: boolean }>;
+	message: string;
+}> {
+	try {
+		const p = await connectBrowser();
+
+		if (!p.url().includes("/checkout")) {
+			return { success: false, methods: [], message: "Not on checkout page. Call go_to_checkout first." };
+		}
+
+		const methods = await p.evaluate(() => {
+			const radios = document.querySelectorAll<HTMLInputElement>('input[name="paymentMethod"]');
+			return Array.from(radios).map((radio, i) => {
+				const label = radio.closest("label");
+				const texts = label
+					? Array.from(label.querySelectorAll("p"))
+						.map((p) => p.textContent?.trim())
+						.filter(Boolean)
+						.join(" — ")
+					: radio.value;
+				return {
+					index: i,
+					value: radio.value,
+					label: texts || radio.value,
+					selected: radio.checked,
+				};
+			});
+		});
+
+		return { success: true, methods, message: `Found ${methods.length} payment methods.` };
+	} catch (error) {
+		return {
+			success: false,
+			methods: [],
+			message: `Failed to get payment methods: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+/**
+ * Select a payment method by its index in the radiogroup.
+ */
+export async function selectPaymentMethod(index: number): Promise<{
+	success: boolean;
+	message: string;
+}> {
+	try {
+		const p = await connectBrowser();
+
+		if (!p.url().includes("/checkout")) {
+			return { success: false, message: "Not on checkout page. Call go_to_checkout first." };
+		}
+
+		const result = await p.evaluate((idx) => {
+			const radios = document.querySelectorAll<HTMLInputElement>('input[name="paymentMethod"]');
+			if (idx < 0 || idx >= radios.length) {
+				return { ok: false, msg: `Index ${idx} out of range (0-${radios.length - 1})` };
+			}
+			const label = radios[idx]!.closest("label");
+			if (label) {
+				label.click();
+			} else {
+				radios[idx]!.click();
+			}
+			return { ok: true, msg: `Selected: ${radios[idx]!.value}` };
+		}, index);
+
+		if (!result.ok) return { success: false, message: result.msg };
+		return { success: true, message: result.msg };
+	} catch (error) {
+		return {
+			success: false,
+			message: `Failed to select payment method: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+/**
+ * Click the "Place order" button on the checkout page.
+ * Uses data-test-id="placeOrderBtn" selector from the actual Snoonu DOM.
+ */
+export async function clickPlaceOrder(): Promise<{
+	success: boolean;
+	message: string;
+	url: string;
+}> {
+	const p = await connectBrowser();
+
+	if (!p.url().includes("/checkout")) {
+		return { success: false, message: "Not on checkout page. Call go_to_checkout first.", url: p.url() };
+	}
+
+	const placeBtn = p.locator('[data-test-id="placeOrderBtn"]');
+	const isVisible = await placeBtn.isVisible({ timeout: 3000 }).catch(() => false);
+	if (!isVisible) {
+		return { success: false, message: "Place order button not found on the page.", url: p.url() };
+	}
+
+	const isDisabled = await placeBtn.isDisabled().catch(() => true);
+	if (isDisabled) {
+		return {
+			success: false,
+			message: "Place order button is disabled. Ensure a payment method is selected and address details are filled in.",
+			url: p.url(),
+		};
+	}
+
+	await placeBtn.click();
+
+	// Wait for navigation away from checkout (order confirmation or error)
+	try {
+		await p.waitForURL((url) => !url.toString().includes("/checkout"), { timeout: 30000 });
+	} catch {
+		// May stay on same page with error
+	}
+
+	await p.waitForTimeout(2000);
+	const finalUrl = p.url();
+
+	if (finalUrl.includes("/order") || finalUrl.includes("/tracking")) {
+		return { success: true, message: "Order placed successfully!", url: finalUrl };
+	}
+
+	if (finalUrl !== "https://snoonu.com/checkout") {
+		return { success: true, message: "Order submitted.", url: finalUrl };
+	}
+
+	return {
+		success: false,
+		message: "Order may not have been placed. The page did not navigate away from checkout.",
+		url: finalUrl,
+	};
+}
+
+/**
  * Clean up browser connection.
  */
 export async function closeBrowser(): Promise<void> {
