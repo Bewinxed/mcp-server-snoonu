@@ -4,8 +4,9 @@
  * Cart MCP Tools
  * add_to_cart, get_cart, remove_from_cart, clear_cart
  *
- * Mutation responses return summary only (total, count).
- * Use get_cart for the full item listing.
+ * Uses an in-memory cart store (api-client) as the source of truth.
+ * multicart/sync is a FULL REPLACEMENT endpoint — sending empty items clears
+ * the server cart, so we never call it to "read".
  *
  * After every cart mutation we sync to browser localStorage via
  * syncCartToLocalStorage(). Snoonu's Next.js frontend reads cart from
@@ -14,9 +15,10 @@
 
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { syncCart, getCart } from "../../lib/api-client";
+import { addToCart, getCart, syncCart, clearCartOnServer } from "../../lib/api-client";
 import { isAuthenticated } from "../../lib/session-manager";
 import { syncCartToLocalStorage } from "../../lib/browser";
+import { productCache } from "./search";
 
 function authError(action: string) {
 	return {
@@ -58,14 +60,23 @@ Returns a summary with items added, cart total, and item count. Use get_cart for
 		async ({ items }) => {
 			if (!isAuthenticated()) return authError("add items to cart");
 
-			const cartState = await syncCart(
-				items.map((item) => ({
+			// Look up product details from search cache for each item
+			const enrichedItems = items.map((item) => {
+				const cached = productCache.get(item.product_id);
+				return {
 					productId: item.product_id,
 					quantity: item.quantity || 1,
-				})),
-			);
+					name: cached?.name,
+					merchantId: cached?.merchantId,
+					imageUrl: cached?.imageUrl,
+					price: cached?.price,
+					isAvailable: cached?.isAvailable,
+				};
+			});
 
-			await syncCartToLocalStorage(cartState.items);
+			const cartState = await addToCart(enrichedItems);
+
+			await syncCartToLocalStorage(cartState.items).catch(() => {});
 
 			return {
 				content: [
@@ -84,12 +95,12 @@ Returns a summary with items added, cart total, and item count. Use get_cart for
 
 	server.tool(
 		"get_cart",
-		`Retrieve the current shopping cart contents from the Snoonu API. Returns each item's product_id, name, quantity, unit price, and line total, plus the cart subtotal and total item count.
+		`Retrieve the current shopping cart contents. Returns each item's product_id, name, quantity, unit price, and line total, plus the cart subtotal and total item count.
 
 Does not require login, but returns an empty cart if the user is not authenticated. Use this to show the user what's in their cart before proceeding to go_to_checkout.`,
 		{},
 		async () => {
-			const cart = await getCart();
+			const cart = getCart();
 
 			if (cart.items.length === 0) {
 				return {
@@ -140,11 +151,18 @@ Returns an updated summary with the new cart total and item count. To remove all
 		async ({ product_id }) => {
 			if (!isAuthenticated()) return authError("modify cart");
 
-			const cartState = await syncCart([
-				{ productId: product_id, quantity: 0 },
-			]);
+			// Set quantity to 0 for the item to remove, keep others
+			const cart = getCart();
+			const allItems = cart.items
+				.map((i) => ({
+					productId: i.productId,
+					quantity: i.productId === product_id ? 0 : i.quantity,
+				}))
+				.filter((i) => i.quantity > 0);
 
-			await syncCartToLocalStorage(cartState.items);
+			const cartState = await syncCart(allItems);
+
+			await syncCartToLocalStorage(cartState.items).catch(() => {});
 
 			return {
 				content: [
@@ -170,7 +188,7 @@ Use this when the user wants to start fresh or discard their current cart. To re
 		async () => {
 			if (!isAuthenticated()) return authError("clear cart");
 
-			const currentCart = await getCart();
+			const currentCart = getCart();
 
 			if (currentCart.items.length === 0) {
 				return {
@@ -183,14 +201,8 @@ Use this when the user wants to start fresh or discard their current cart. To re
 				};
 			}
 
-			await syncCart(
-				currentCart.items.map((item) => ({
-					productId: item.productId,
-					quantity: 0,
-				})),
-			);
-
-			await syncCartToLocalStorage([]);
+			await clearCartOnServer();
+			await syncCartToLocalStorage([]).catch(() => {});
 
 			return {
 				content: [

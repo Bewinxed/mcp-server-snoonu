@@ -25,23 +25,11 @@ export interface MulticartSyncData {
 	cart_id: string | null;
 }
 
+/** Response item from multicart/sync — nested product_identity, not flat. */
 export interface CartItem {
-	product_id: string;
-	merchant_id: number;
-	name: string;
-	english_name: string;
-	image_url: string;
-	price: number;
+	product_identity: ProductIdentity;
 	quantity: number;
-	total_price: number;
-	choice_items: ChoiceItem[];
-	special_request: string;
-	is_available: boolean;
-	is_instock: boolean;
-}
-
-export interface ChoiceItem {
-	id: string;
-	name: string;
-	price: number;
+	is_buy_later: boolean;
+	/** Convenience alias used in api-client mapping */
+	product_id?: string;
 }

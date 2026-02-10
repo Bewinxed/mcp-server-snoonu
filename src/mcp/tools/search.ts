@@ -29,7 +29,7 @@ import {
 // ---------------------------------------------------------------------------
 // In-memory product cache — populated by every search, read by get_product_details
 // ---------------------------------------------------------------------------
-const productCache = new Map<
+export const productCache = new Map<
 	string,
 	ProductResult & { merchantName: string }
 >();

@@ -194,6 +194,35 @@ export async function searchInMerchant(
 
 // ---------- Cart ----------
 
+// In-memory cart store — the single source of truth for cart contents.
+// multicart/sync is a FULL REPLACEMENT endpoint: sending empty items clears
+// the cart, so we must never call it to "read" — instead we track state here.
+const cartStore = new Map<string, CartItemState>();
+let cartId: string | null = null;
+
+/** Register product details so add-to-cart can populate the in-memory store. */
+export function registerProductForCart(product: {
+	productId: string;
+	merchantId: number;
+	name: string;
+	imageUrl: string;
+	price: number;
+	isAvailable: boolean;
+}): void {
+	// Only store if not already in cart (don't overwrite quantity)
+	if (!cartStore.has(product.productId)) {
+		cartStore.set(product.productId, {
+			...product,
+			quantity: 0,
+			totalPrice: 0,
+		});
+	}
+}
+
+/**
+ * Sync the FULL in-memory cart to the server.
+ * multicart/sync replaces the entire server-side cart with what we send.
+ */
 export async function syncCart(
 	items: Array<{
 		productId: string;
@@ -232,68 +261,103 @@ export async function syncCart(
 	}
 
 	// Fire orders/open to activate cart server-side (mirrors browser behavior).
-	// Without this the backend may not fully register the cart change.
 	fetch(`${SNOONU_API_BASE}/v5/orders/open`, {
 		headers,
 		method: "GET",
 	}).catch(() => {});
 
-	return {
-		items: data.data.items.map((item) => ({
-			productId: item.product_id,
-			merchantId: item.merchant_id,
-			name: item.name,
-			imageUrl: item.image_url,
-			price: item.price,
-			quantity: item.quantity,
-			totalPrice: item.total_price,
-			isAvailable: item.is_available && item.is_instock,
-		})),
-		totalQuantity: data.data.total_quantity,
-		totalPrice: data.data.full_cart_price,
-		cartId: data.data.cart_id,
-	};
+	// Update in-memory store from the server response.
+	// The response only contains product_identity + quantity, so we merge
+	// with existing details already in cartStore.
+	const serverItems = new Set<string>();
+	for (const item of data.data.items) {
+		const pid = (item as any).product_identity?.product_id ?? (item as any).product_id;
+		if (!pid) continue;
+		serverItems.add(pid);
+		const qty = item.quantity ?? (item as any).quantity ?? 0;
+		const existing = cartStore.get(pid);
+		if (existing) {
+			existing.quantity = qty;
+			existing.totalPrice = existing.price * qty;
+		}
+	}
+
+	// Remove items the server no longer has
+	for (const [pid] of cartStore) {
+		if (!serverItems.has(pid)) cartStore.delete(pid);
+	}
+
+	cartId = data.data.cart_id;
+
+	return getCart();
 }
 
 /**
- * Get cart by syncing with empty diff (returns current state).
- * Note: The multicart/sync endpoint with empty items returns current cart.
+ * Add items to the cart. Merges with existing in-memory cart, then syncs
+ * the full cart to the server.
  */
-export async function getCart(): Promise<CartState> {
-	await loadSession();
-	const headers = getApiHeaders();
-
-	if (!isAuthenticated()) {
-		return { items: [], totalQuantity: 0, totalPrice: 0, cartId: null };
+export async function addToCart(
+	items: Array<{
+		productId: string;
+		quantity: number;
+		name?: string;
+		merchantId?: number;
+		imageUrl?: string;
+		price?: number;
+		isAvailable?: boolean;
+	}>
+): Promise<CartState> {
+	// Merge into in-memory store
+	for (const item of items) {
+		const existing = cartStore.get(item.productId);
+		if (existing) {
+			existing.quantity = item.quantity;
+			existing.totalPrice = existing.price * item.quantity;
+		} else {
+			cartStore.set(item.productId, {
+				productId: item.productId,
+				merchantId: item.merchantId ?? 0,
+				name: item.name ?? item.productId,
+				imageUrl: item.imageUrl ?? "",
+				price: item.price ?? 0,
+				quantity: item.quantity,
+				totalPrice: (item.price ?? 0) * item.quantity,
+				isAvailable: item.isAvailable ?? true,
+			});
+		}
 	}
 
-	// Sync with empty items to get current cart state
-	const res = await fetch(`${SNOOMARKET_API_BASE}/v1/multicart/sync`, {
+	// Build full cart for sync (all items, not just new ones)
+	const allItems = Array.from(cartStore.values())
+		.filter((i) => i.quantity > 0)
+		.map((i) => ({ productId: i.productId, quantity: i.quantity }));
+
+	return syncCart(allItems);
+}
+
+/**
+ * Get cart from in-memory store (non-destructive).
+ * Never calls the API — multicart/sync with empty items clears the cart.
+ */
+export function getCart(): CartState {
+	const items = Array.from(cartStore.values()).filter((i) => i.quantity > 0);
+	const totalQuantity = items.reduce((sum, i) => sum + i.quantity, 0);
+	const totalPrice = items.reduce((sum, i) => sum + i.totalPrice, 0);
+	return { items, totalQuantity, totalPrice, cartId };
+}
+
+/** Clear the in-memory cart and sync empty state to server. */
+export async function clearCartOnServer(): Promise<void> {
+	cartStore.clear();
+	cartId = null;
+	await loadSession();
+	const headers = getApiHeaders();
+	if (!isAuthenticated()) return;
+	await fetch(`${SNOOMARKET_API_BASE}/v1/multicart/sync`, {
 		method: "POST",
 		headers,
 		body: JSON.stringify({ items: [] }),
 	});
-	const data: MulticartSyncResponse = await res.json();
-
-	if (!data.is_success || !data.data) {
-		return { items: [], totalQuantity: 0, totalPrice: 0, cartId: null };
-	}
-
-	return {
-		items: data.data.items.map((item) => ({
-			productId: item.product_id,
-			merchantId: item.merchant_id,
-			name: item.name,
-			imageUrl: item.image_url,
-			price: item.price,
-			quantity: item.quantity,
-			totalPrice: item.total_price,
-			isAvailable: item.is_available && item.is_instock,
-		})),
-		totalQuantity: data.data.total_quantity,
-		totalPrice: data.data.full_cart_price,
-		cartId: data.data.cart_id,
-	};
 }
 
 // ---------- Address / Location ----------

@@ -15,7 +15,7 @@ export function registerCheckoutTools(server: McpServer) {
 		"go_to_checkout",
 		`Open the Snoonu checkout page in the browser so the user can review and complete their order. Does NOT place the order automatically — the user must confirm payment and delivery details themselves.
 
-Requires login and a non-empty cart. Before navigating, this tool syncs the current API cart state to the browser's localStorage so the checkout page displays the correct items. Returns the checkout URL and a cart summary (items, quantities, subtotal).
+Requires login and a non-empty cart. Before navigating, this tool syncs the current cart state to the browser's localStorage so the checkout page displays the correct items. Returns the checkout URL and a cart summary (items, quantities, subtotal).
 
 If the cart is empty, returns an error suggesting add_to_cart. Call get_cart first if you want to show the user their cart contents before proceeding to checkout.`,
 		{},
@@ -35,7 +35,8 @@ If the cart is empty, returns an error suggesting add_to_cart. Call get_cart fir
 				};
 			}
 
-			const cart = await getCart();
+			// getCart() is now non-destructive (reads from in-memory store)
+			const cart = getCart();
 
 			if (cart.items.length === 0) {
 				return {
