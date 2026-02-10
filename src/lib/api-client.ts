@@ -266,28 +266,21 @@ export async function syncCart(
 		method: "GET",
 	}).catch(() => {});
 
-	// Update in-memory store from the server response.
-	// The response only contains product_identity + quantity, so we merge
-	// with existing details already in cartStore.
-	const serverItems = new Set<string>();
-	for (const item of data.data.items) {
-		const pid = (item as any).product_identity?.product_id ?? (item as any).product_id;
-		if (!pid) continue;
-		serverItems.add(pid);
-		const qty = item.quantity ?? (item as any).quantity ?? 0;
-		const existing = cartStore.get(pid);
-		if (existing) {
-			existing.quantity = qty;
-			existing.totalPrice = existing.price * qty;
-		}
-	}
-
-	// Remove items the server no longer has
-	for (const [pid] of cartStore) {
-		if (!serverItems.has(pid)) cartStore.delete(pid);
-	}
-
+	// Extract cart_id from server response. We do NOT reconcile our in-memory
+	// store with the response because the API silently drops items it doesn't
+	// recognise (returns 200 + empty items). Our in-memory store is the source
+	// of truth; reconciling would wipe the cart.
 	cartId = data.data.cart_id;
+
+	// Log discrepancies for debugging (stderr so it doesn't pollute MCP JSON).
+	const sentCount = items.length;
+	const serverCount = data.data.items?.length ?? 0;
+	if (serverCount !== sentCount) {
+		console.error(
+			`[cart] multicart/sync: sent ${sentCount} items, server accepted ${serverCount}. ` +
+			`cart_id=${cartId}, total_quantity=${data.data.total_quantity}, full_cart_price=${data.data.full_cart_price}`
+		);
+	}
 
 	return getCart();
 }
