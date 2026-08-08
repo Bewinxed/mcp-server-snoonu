@@ -98,8 +98,11 @@ refuses to start unencrypted-and-open:
 
 | Variable | Purpose |
 | -------- | ------- |
-| `MCP_AUTH_TOKEN` | **Required.** Clients must send `Authorization: Bearer <token>` |
-| `ALLOW_ANONYMOUS=1` | Explicit opt-out of the above. Only for a genuinely private port |
+| `MCP_OAUTH_PASSWORD` | Password shown on the approval page. **Set this** — without it anyone who reaches the page can approve a client |
+| `MCP_OAUTH_SIGNING_KEY` | Signs issued tokens. Without it a restart invalidates every connection |
+| `MCP_PUBLIC_URL` | Public https URL, if it can't be auto-detected |
+| `MCP_AUTH_TOKEN` | Static bearer token instead of OAuth (needs `MCP_OAUTH=off`) |
+| `ALLOW_ANONYMOUS=1` | No auth at all. Only for a genuinely private port |
 | `HOST` | Bind address. **Must be `0.0.0.0` for containers/remote** (default `127.0.0.1`) |
 | `PORT` | Port (default `3000`) |
 | `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host`. **Usually unnecessary** — auto-detected, see below |
@@ -109,9 +112,39 @@ refuses to start unencrypted-and-open:
 ```bash
 docker run -p 3000:3000 \
   -e HOST=0.0.0.0 \
-  -e MCP_AUTH_TOKEN=$(openssl rand -hex 32) \
+  -e MCP_OAUTH_PASSWORD='a-passphrase-you-choose' \
+  -e MCP_OAUTH_SIGNING_KEY=$(openssl rand -hex 32) \
   mcp-server-snoonu
 ```
+
+Then add `https://your-domain/mcp` in Claude Code's connectors page and click
+Connect — the OAuth flow runs in the browser, you enter the password once, and
+the client stores its own token.
+
+#### OAuth
+
+The server is an OAuth 2.1 Resource Server **and** ships a small Authorization
+Server, so no third-party identity provider is needed. It implements the pieces
+MCP clients actually use:
+
+- RFC 9728 Protected Resource Metadata at
+  `/.well-known/oauth-protected-resource/mcp`
+- RFC 8414 AS metadata at `/.well-known/oauth-authorization-server`
+- Authorization code + **PKCE (S256 required)**, RFC 8707 resource binding,
+  RFC 9207 `iss`, and open client registration
+- `401` with `WWW-Authenticate: Bearer …, resource_metadata="…"` so clients can
+  discover all of the above
+
+Tokens are audience-bound: one minted for a different resource is rejected.
+
+> [!IMPORTANT]
+> This authorises access to **one** Snoonu session — the one on the server.
+> It is a gate in front of your own account, not multi-user identity. Anyone who
+> completes the flow shops as you, which is why `MCP_OAUTH_PASSWORD` matters.
+
+To use an external AS (Auth0, Clerk, WorkOS…) instead, set `MCP_OAUTH=off` and
+put a reverse proxy in front, or open an issue — pointing at a third-party
+issuer is a small change.
 
 #### Host validation, and why you probably don't need to configure it
 

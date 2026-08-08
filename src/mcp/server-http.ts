@@ -30,22 +30,34 @@ import {
 	originValidationResponse,
 	localhostAllowedHostnames,
 	localhostAllowedOrigins,
+	requireBearerAuth,
+	buildOAuthProtectedResourceMetadata,
+	getOAuthProtectedResourceMetadataUrl,
 } from "@modelcontextprotocol/server";
 import { createSnoonuServer } from "./create-server";
 import { flush } from "./lib/store";
+import {
+	handleOAuth,
+	createVerifier,
+	authorizationServerMetadata,
+	SUPPORTED_SCOPES,
+} from "./lib/oauth";
 
 const PORT = Number(process.env.PORT) || 3000;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const ALLOW_ANONYMOUS = process.env.ALLOW_ANONYMOUS === "1";
+/** OAuth is the default for remote use; opt out only to use a static token. */
+const OAUTH_DISABLED = process.env.MCP_OAUTH === "off";
 
-if (!AUTH_TOKEN && !ALLOW_ANONYMOUS) {
+if (!AUTH_TOKEN && !ALLOW_ANONYMOUS && OAUTH_DISABLED) {
 	console.error(
 		"[fatal] Refusing to start without authentication.\n" +
 			"  This server can place real orders using the host's Snoonu session.\n" +
 			"\n" +
-			"  Set ONE of these environment variables and redeploy:\n" +
+			"  You set MCP_OAUTH=off, so pick one of:\n" +
 			"    MCP_AUTH_TOKEN=<secret>   require Authorization: Bearer <secret>\n" +
 			"    ALLOW_ANONYMOUS=1         no auth (only for a genuinely private port)\n" +
+			"    unset MCP_OAUTH           use the built-in OAuth flow (recommended)\n" +
 			"\n" +
 			"  Generate a token with:  openssl rand -hex 32\n" +
 			"\n" +
@@ -141,6 +153,59 @@ const hostSource = explicitHosts
 		: isLoopbackBind
 			? "loopback default"
 			: "disabled";
+
+// ---------------------------------------------------------------------------
+// OAuth (Resource Server + a small built-in Authorization Server)
+// ---------------------------------------------------------------------------
+
+/**
+ * Public base URL of this deployment. OAuth needs an absolute issuer and
+ * resource identifier, so reuse the same platform detection as the host
+ * allowlist rather than asking the operator for it twice.
+ */
+function detectPublicBaseUrl(): string {
+	const explicit = process.env.MCP_PUBLIC_URL || process.env.PUBLIC_URL;
+	if (explicit?.trim()) {
+		const v = explicit.trim();
+		return (v.includes("://") ? v : `https://${v}`).replace(/\/$/, "");
+	}
+	const host = detected?.hosts[0] ?? explicitHosts?.[0];
+	if (host) return `https://${host}`;
+	return `http://localhost:${PORT}`;
+}
+
+const PUBLIC_BASE = detectPublicBaseUrl();
+const RESOURCE_URL = `${PUBLIC_BASE}/mcp`;
+const isInsecureIssuer = PUBLIC_BASE.startsWith("http://");
+const OAUTH_ENABLED = !OAUTH_DISABLED && !ALLOW_ANONYMOUS;
+
+const oauthConfig = {
+	issuer: PUBLIC_BASE,
+	resource: RESOURCE_URL,
+	password: process.env.MCP_OAUTH_PASSWORD,
+};
+
+const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(
+	new URL(RESOURCE_URL),
+);
+
+/** Fail fast on a misconfigured issuer rather than at first request. */
+const protectedResourceMetadata = OAUTH_ENABLED
+	? buildOAuthProtectedResourceMetadata({
+			oauthMetadata: authorizationServerMetadata(oauthConfig) as any,
+			resourceServerUrl: new URL(RESOURCE_URL),
+			resourceName: "Snoonu MCP",
+			scopesSupported: SUPPORTED_SCOPES,
+			dangerouslyAllowInsecureIssuerUrl: isInsecureIssuer,
+		})
+	: null;
+
+const bearerGate = OAUTH_ENABLED
+	? requireBearerAuth({
+			verifier: createVerifier(RESOURCE_URL, PUBLIC_BASE),
+			resourceMetadataUrl,
+		})
+	: null;
 
 const explicitOrigins = process.env.MCP_ALLOWED_ORIGINS?.split(",")
 	.map((o) => o.trim())
@@ -245,6 +310,24 @@ const server = Bun.serve({
 			return Response.json({ status: "ok" });
 		}
 
+		// --- OAuth discovery + Authorization Server ------------------------
+		// These must be reachable WITHOUT a token: they are how a client learns
+		// where to authorise. Serving them behind the bearer gate is the
+		// classic way to make "Connect" fail with no explanation.
+		if (OAUTH_ENABLED && protectedResourceMetadata) {
+			// RFC 9728. Path-aware: /mcp resource -> /.well-known/...-resource/mcp.
+			// Accept the bare path too, since clients probe both.
+			if (
+				url.pathname === "/.well-known/oauth-protected-resource" ||
+				url.pathname === "/.well-known/oauth-protected-resource/mcp"
+			) {
+				return withCors(Response.json(protectedResourceMetadata), req);
+			}
+
+			const oauthResponse = await handleOAuth(req, oauthConfig);
+			if (oauthResponse) return withCors(oauthResponse, req);
+		}
+
 		if (url.pathname !== "/mcp") {
 			return new Response("Not Found", { status: 404 });
 		}
@@ -272,7 +355,13 @@ const server = Bun.serve({
 			return withCors(explainedRejection(originRejection, "origin"), req);
 		}
 
-		if (AUTH_TOKEN) {
+		// OAuth takes precedence: it returns a 401 carrying the
+		// WWW-Authenticate challenge with resource_metadata, which is what lets
+		// a client discover the AS and start the flow.
+		if (bearerGate) {
+			const gate = await bearerGate(req);
+			if (gate instanceof Response) return withCors(gate, req);
+		} else if (AUTH_TOKEN) {
 			const header = req.headers.get("authorization") ?? "";
 			const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
 			if (!provided || !tokenMatches(provided, AUTH_TOKEN)) {
@@ -289,7 +378,32 @@ console.error(
 );
 console.error(`  Health:  /health`);
 console.error(`  MCP:     /mcp`);
-console.error(`  Auth:    ${AUTH_TOKEN ? "bearer token required" : "ANONYMOUS (insecure)"}`);
+console.error(
+	`  Auth:    ${
+		OAUTH_ENABLED
+			? `OAuth 2.1 (authorization code + PKCE)${oauthConfig.password ? " + password" : ""}`
+			: AUTH_TOKEN
+				? "static bearer token"
+				: "ANONYMOUS (insecure)"
+	}`,
+);
+if (OAUTH_ENABLED) {
+	console.error(`  Connect: ${RESOURCE_URL}`);
+	console.error(`  Metadata:${resourceMetadataUrl}`);
+	if (!oauthConfig.password) {
+		console.error(
+			`\n  WARNING: MCP_OAUTH_PASSWORD is unset, so ANYONE who reaches the\n` +
+				`  authorize page can approve a client and shop with your Snoonu\n` +
+				`  account. Set it before exposing this publicly.`,
+		);
+	}
+	if (isInsecureIssuer) {
+		console.error(
+			`\n  NOTE: issuer is http:// (${PUBLIC_BASE}). Fine locally; real clients\n` +
+				`  require https. Set MCP_PUBLIC_URL to your https URL.`,
+		);
+	}
+}
 console.error(
 	`  Hosts:   ${allowedHosts ? `${allowedHosts.join(", ")}  [${hostSource}]` : "any (not checked — no public hostname found)"}`,
 );
