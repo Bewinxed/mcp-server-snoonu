@@ -55,6 +55,62 @@ Add to your `claude_desktop_config.json`:
 | `remove_from_cart`     | Remove items from cart                                         |
 | `clear_cart`           | Empty the entire cart                                          |
 | `go_to_checkout`       | Navigate to checkout                                           |
+| `get_payment_methods`  | List payment methods on the checkout page                      |
+| `select_payment_method`| Choose a payment method by index                               |
+| `place_order`          | **Submits the order and charges real money**                   |
+
+Every tool carries MCP [tool annotations](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
+so clients can gate them. `place_order` is marked `destructiveHint: true`; all
+search/browse/read tools are `readOnlyHint: true`. Tools also declare an
+`outputSchema` and return `structuredContent`, so clients get typed results
+rather than JSON embedded in a text block.
+
+You do **not** need to call `init_session` first — authentication resolves
+lazily from the saved session on any tool that needs it. `init_session` remains
+available as a diagnostic.
+
+## Requirements
+
+- Node.js **20+** (or Bun 1.x)
+- Chromium via Playwright for the login and checkout flows: `npx playwright install chromium`
+
+## Protocol support
+
+Speaks MCP **2026-07-28** (via `@modelcontextprotocol/server` v2) and falls back
+automatically to the 2025-era `initialize` handshake for older clients, so both
+generations of client work against the same binary.
+
+Because 2026-07-28 removes protocol sessions, this server keeps no per-connection
+state. Product metadata and cart contents live in a persistent store:
+
+| Backend | When | Location |
+| ------- | ---- | -------- |
+| Disk (default) | `npx` / stdio / local | `~/.mcp-server-snoonu/store.json` (mode 0600) |
+| Redis (opt-in) | Docker / multi-replica HTTP | set `REDIS_URL` (requires Bun) |
+
+This is what makes a product id from one session still resolvable in the next —
+Snoonu has no fetch-product-by-id endpoint, so results must be remembered.
+
+## Remote / HTTP deployment
+
+The HTTP entry point can place real orders using the host's Snoonu session, so it
+refuses to start unencrypted-and-open:
+
+| Variable | Purpose |
+| -------- | ------- |
+| `MCP_AUTH_TOKEN` | **Required.** Clients must send `Authorization: Bearer <token>` |
+| `ALLOW_ANONYMOUS=1` | Explicit opt-out of the above. Only for a genuinely private port |
+| `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host` (default: localhost only) |
+| `MCP_ALLOWED_ORIGINS` | Comma-separated origin hostnames for CORS (default: localhost only) |
+| `HOST` / `PORT` | Bind address (default `127.0.0.1`) and port (default `3000`) |
+| `REDIS_URL` | Share cart/product state across replicas |
+
+Host and Origin headers are validated on every request (DNS-rebinding
+protection, as the spec requires).
+
+```bash
+docker run -p 3000:3000 -e MCP_AUTH_TOKEN=$(openssl rand -hex 32) mcp-server-snoonu
+```
 
 ## Architecture
 
@@ -63,12 +119,17 @@ src/
 ├── mcp/
 │   ├── server.ts          # Stdio entry point (local use via npx/bunx)
 │   ├── server-http.ts     # HTTP entry point (remote/Docker deployment)
-│   ├── create-server.ts   # Shared server factory
+│   ├── create-server.ts   # Shared server factory (per-connection, stateless)
+│   ├── lib/
+│   │   ├── result.ts      # ok()/fail() helpers — fail() sets isError at the protocol level
+│   │   ├── store.ts       # Persistent product/cart store (disk or Redis)
+│   │   ├── cart-state.ts  # Bridges api-client's in-memory cart with the store
+│   │   └── auth.ts        # Lazy session loading
 │   └── tools/             # Tool definitions (Zod schemas + handlers)
 │       ├── session.ts     # init_session, login, verify_otp, logout
 │       ├── search.ts      # search_products, bulk_search, search_in_merchant, get_product_details
 │       ├── cart.ts        # add_to_cart, get_cart, remove_from_cart, clear_cart
-│       ├── checkout.ts    # go_to_checkout
+│       ├── checkout.ts    # go_to_checkout, get_payment_methods, select_payment_method, place_order
 │       ├── browse.ts      # browse_categories
 │       └── location.ts    # get_saved_addresses, set_delivery_location
 ├── lib/
@@ -91,6 +152,13 @@ bun install
 
 # Run directly with Bun (no build step)
 bun run dev
+
+# Typecheck and test (tests drive the real server over stdio)
+bun run typecheck
+bun test
+
+# Skip tests that hit the live Snoonu API
+SNOONU_OFFLINE=1 bun test
 
 # Build for npm
 bun run build

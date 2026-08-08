@@ -9,17 +9,24 @@
  *
  * Register in Claude Code:
  *   claude mcp add snoonu -- npx -y mcp-server-snoonu
+ *
+ * Speaks MCP 2026-07-28. `serveStdio` defaults to legacy: 'serve', so a
+ * 2025-era client that opens with `initialize` is still served correctly from
+ * the same factory — no branching needed here.
  */
 
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createSnoonuServer } from "./create-server";
+import { flush } from "./lib/store";
 
-const server = createSnoonuServer();
-const transport = new StdioServerTransport();
+const handle = await serveStdio(createSnoonuServer);
 
-process.stdin.resume();
+async function shutdown(): Promise<void> {
+	// Flush pending store writes so a cart mutation isn't lost on exit.
+	await flush().catch(() => {});
+	await handle.close().catch(() => {});
+	process.exit(0);
+}
 
-await server.connect(transport);
-
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

@@ -6,8 +6,7 @@
       "DOM"
     ],
     "types": [
-      "bun-types",
-      "./types.d.ts"
+      "@types/bun"
     ],
     "target": "ESNext",
     "module": "ESNext",
@@ -32,5 +31,16 @@
     "noPropertyAccessFromIndexSignature": false
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "snoonu-ui"]
+  "exclude": [
+    "node_modules",
+    "snoonu-ui",
+    // Unreachable from the MCP entrypoints (verified by import-closure walk) and
+    // referencing uninstalled packages (@anthropic-ai/claude-agent-sdk, valibot).
+    // Left in place rather than deleted, but excluded so `tsc --noEmit` is
+    // meaningful for the code that actually ships.
+    "src/index.ts",
+    "src/openrouter.ts",
+    "src/agent",
+    "src/lib/snoonu.ts"
+  ]
 }

@@ -200,6 +200,21 @@ export async function searchInMerchant(
 const cartStore = new Map<string, CartItemState>();
 let cartId: string | null = null;
 
+/**
+ * Replace the in-memory cart with a previously persisted set of items.
+ *
+ * The in-memory store is still the source of truth for a single sync cycle
+ * (multicart/sync is full-replacement and the API silently drops items it
+ * doesn't recognise, so reconciling from the response would wipe the cart).
+ * But "in-memory" used to mean "gone on restart" — this lets the MCP tool layer
+ * rehydrate it from disk/Redis so a cart survives across processes.
+ */
+export function hydrateCart(items: CartItemState[], id?: string | null): void {
+	cartStore.clear();
+	for (const i of items) cartStore.set(i.productId, { ...i });
+	if (id !== undefined) cartId = id;
+}
+
 /** Register product details so add-to-cart can populate the in-memory store. */
 export function registerProductForCart(product: {
 	productId: string;

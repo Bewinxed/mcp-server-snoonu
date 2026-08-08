@@ -57,6 +57,12 @@ export async function connectBrowser(): Promise<Page> {
 		}
 		throw err;
 	}
+	if (!browser) {
+		throw new Error(
+			"Failed to launch Chromium — the browser handle was null after launch. Try `npx playwright install chromium`.",
+		);
+	}
+
 	context = await browser.newContext();
 
 	// Restore saved session cookies so the browser is already logged in

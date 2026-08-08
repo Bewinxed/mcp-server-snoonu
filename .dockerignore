@@ -2,3 +2,10 @@ node_modules
 dist
 .git
 *.md
+
+# Session / auth data — NEVER bake credentials into an image
+*session*.json
+.env
+.env.*
+!.env.example
+.mcp-server-snoonu/

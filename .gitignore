@@ -35,6 +35,13 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .tldr
 
 # Session / auth data — NEVER commit
+# NOTE: gitignore does not apply to already-tracked files. src/snoonu-session.json
+# was committed before these rules existed and leaked a live authToken; it has
+# been untracked, but it remains in git history until that history is rewritten.
 snoonu-session.json
 *-session.json
+*session*.json
 .mcp-server-snoonu/
+
+# local e2e probes
+e2e-probe*.ts

@@ -9,95 +9,86 @@
  */
 
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { getSavedAddresses, setDeliveryLocation } from "../../lib/api-client";
-import { isAuthenticated, getSession } from "../../lib/session-manager";
+import { getSession } from "../../lib/session-manager";
 import { syncLocationToBrowser } from "../../lib/browser";
+import { ensureAuthenticated } from "../lib/auth";
+import { ok, fail, authRequired } from "../lib/result";
 
 export function registerLocationTools(server: McpServer) {
-	server.tool(
+	server.registerTool(
 		"get_saved_addresses",
-		`List all saved delivery addresses for the logged-in user. Returns each address's id, label (e.g. "Home", "Office"), and full address string, plus the currently active delivery location.
+		{
+			title: "Get Saved Addresses",
+			description: `List all saved delivery addresses for the logged-in user. Returns each address's id, label (e.g. "Home", "Office"), and full address string, plus the currently active delivery location.
 
 Requires login. Use the address id with set_delivery_location to switch where deliveries go. Changing location affects which merchants are available, delivery fees, and ETAs for all subsequent search and cart operations.`,
-		{},
+			outputSchema: z.object({
+				current: z.string().nullable().optional(),
+				addresses: z.array(z.object({
+					id: z.number(),
+					label: z.string(),
+					address: z.string(),
+				})),
+			}),
+			annotations: {
+				readOnlyHint: true,
+				openWorldHint: false,
+			},
+		},
 		async () => {
-			if (!isAuthenticated()) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								error: true,
-								message:
-									"Must be logged in. Call init_session first, then login.",
-							}),
-						},
-					],
-				};
+			if (!(await ensureAuthenticated())) {
+				return authRequired("get saved addresses");
 			}
 
 			try {
 				const addresses = await getSavedAddresses();
 				const session = getSession();
 
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								current: session?.location?.address || null,
-								addresses: addresses.map((a) => ({
-									id: a.id,
-									label: a.label,
-									address: a.address,
-								})),
-							}),
-						},
-					],
-				};
+				return ok({
+					current: session?.location?.address || null,
+					addresses: addresses.map((a) => ({
+						id: a.id,
+						label: a.label,
+						address: a.address,
+					})),
+				});
 			} catch (error) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								error: true,
-								message: `Failed to get addresses: ${error instanceof Error ? error.message : String(error)}`,
-							}),
-						},
-					],
-				};
+				return fail(
+					`Failed to get addresses: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 		},
 	);
 
-	server.tool(
+	server.registerTool(
 		"set_delivery_location",
-		`Switch the active delivery location to a saved address. This changes which merchants are available, delivery fees, ETAs, and product availability for ALL subsequent operations (search, cart, checkout).
+		{
+			title: "Set Delivery Location",
+			description: `Switch the active delivery location to a saved address. This changes which merchants are available, delivery fees, ETAs, and product availability for ALL subsequent operations (search, cart, checkout).
 
 Requires login. The address_id must come from a previous get_saved_addresses call. Updates the session's coordinates on disk and syncs the location to the browser cookie so the Snoonu website reflects the change.
 
 Call get_saved_addresses first to show the user their options, then use this tool with their chosen address id.`,
-		{
-			address_id: z
-				.number()
-				.describe("Numeric address ID from a previous get_saved_addresses result, e.g. 12345"),
+			inputSchema: z.object({
+				address_id: z
+					.number()
+					.describe("Numeric address ID from a previous get_saved_addresses result, e.g. 12345"),
+			}),
+			outputSchema: z.object({
+				set: z.string(),
+			}),
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: true,
+				openWorldHint: false,
+			},
 		},
 		async ({ address_id }) => {
-			if (!isAuthenticated()) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								error: true,
-								message:
-									"Must be logged in. Call init_session first, then login.",
-							}),
-						},
-					],
-				};
+			if (!(await ensureAuthenticated())) {
+				return authRequired("set delivery location");
 			}
 
 			try {
@@ -110,28 +101,13 @@ Call get_saved_addresses first to show the user their options, then use this too
 					address.longitude,
 				);
 
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								set: `${address.label} — ${address.address}`,
-							}),
-						},
-					],
-				};
+				return ok({
+					set: `${address.label} — ${address.address}`,
+				});
 			} catch (error) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								error: true,
-								message: `Failed: ${error instanceof Error ? error.message : String(error)}`,
-							}),
-						},
-					],
-				};
+				return fail(
+					`Failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
 			}
 		},
 	);
