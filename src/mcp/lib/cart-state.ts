@@ -21,13 +21,19 @@ import {
 	setCartId,
 	type CartRecord,
 } from "./store";
+import { PerUser } from "./user-context";
 
-let hydrated = false;
+/**
+ * Hydration is tracked PER USER. A single boolean would mean the first user to
+ * touch a cart marks it "done" for everyone, and every later user would run
+ * against whatever was left in memory.
+ */
+const hydrated = new PerUser<boolean>(() => false);
 
 /** Load the persisted cart into api-client's in-memory store. Idempotent. */
 export async function hydrate(): Promise<void> {
-	if (hydrated) return;
-	hydrated = true;
+	if (hydrated.get()) return;
+	hydrated.set(true);
 
 	const [items, id] = await Promise.all([getCartItems(), getCartId()]);
 	if (items.length === 0 && !id) return;

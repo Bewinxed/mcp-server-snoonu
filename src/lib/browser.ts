@@ -15,11 +15,41 @@ import {
 	type CookieData,
 	type SnoonuSession,
 } from "./session-manager";
+import { PerUser, currentUserId } from "../mcp/lib/user-context";
 
 let chromiumExtra: any;
+// Shared across all users — launching one Chromium process per user is very
+// expensive and unnecessary; Playwright BrowserContexts provide full session
+// isolation (separate cookies, storage, service workers) within a single process.
 let browser: Browser | null = null;
-let context: BrowserContext | null = null;
-let page: Page | null = null;
+
+const contexts = new PerUser<BrowserContext | null>(() => null);
+const pages = new PerUser<Page | null>(() => null);
+
+/** Timestamp of last connectBrowser() call per user, for idle eviction. */
+const lastUsed = new Map<string, number>();
+
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Close and discard contexts that have been idle for longer than
+ * IDLE_TIMEOUT_MS. Called on every connectBrowser() access — no setInterval
+ * that would keep the process alive.
+ */
+function evictIdleContexts(): void {
+	const now = Date.now();
+	const self = currentUserId();
+	for (const [userId] of contexts.entries()) {
+		if (userId === self) continue;
+		const ts = lastUsed.get(userId) ?? 0;
+		if (now - ts <= IDLE_TIMEOUT_MS) continue;
+		const ctx = contexts.get(userId);
+		if (ctx) ctx.close().catch(() => {});
+		contexts.delete(userId);
+		pages.delete(userId);
+		lastUsed.delete(userId);
+	}
+}
 
 async function loadPlaywright() {
 	if (chromiumExtra) return;
@@ -39,36 +69,49 @@ async function loadPlaywright() {
 /**
  * Launch a Playwright-managed Chromium instance.
  * Restores session cookies if a saved session exists.
+ *
+ * The browser process is shared; each user gets their own BrowserContext
+ * (separate cookies, storage, session) created on demand.
  */
 export async function connectBrowser(): Promise<Page> {
-	if (page && !page.isClosed()) return page;
+	const userId = currentUserId();
+
+	evictIdleContexts();
+
+	const existingPage = pages.get(userId);
+	if (existingPage && !existingPage.isClosed()) {
+		lastUsed.set(userId, Date.now());
+		return existingPage;
+	}
 
 	await loadPlaywright();
 
-	try {
-		browser = await chromiumExtra.launch({
-			headless: process.env.HEADLESS !== "false",
-		});
-	} catch (err: any) {
-		if (err?.message?.includes("Executable doesn't exist")) {
+	if (!browser || !browser.isConnected()) {
+		try {
+			browser = await chromiumExtra.launch({
+				headless: process.env.HEADLESS !== "false",
+			});
+		} catch (err: any) {
+			if (err?.message?.includes("Executable doesn't exist")) {
+				throw new Error(
+					"Chromium browser is not installed. Run this command to install it: npx playwright install chromium — then retry the operation."
+				);
+			}
+			throw err;
+		}
+		if (!browser) {
 			throw new Error(
-				"Chromium browser is not installed. Run this command to install it: npx playwright install chromium — then retry the operation."
+				"Failed to launch Chromium — the browser handle was null after launch. Try `npx playwright install chromium`.",
 			);
 		}
-		throw err;
-	}
-	if (!browser) {
-		throw new Error(
-			"Failed to launch Chromium — the browser handle was null after launch. Try `npx playwright install chromium`.",
-		);
 	}
 
-	context = await browser.newContext();
+	const ctx = await browser.newContext();
 
 	// Restore saved session cookies so the browser is already logged in
 	const session = await loadSession();
 	if (session?.cookies?.length) {
-		await context.addCookies(
+		await ctx.addCookies(
 			session.cookies.map((c) => ({
 				name: c.name,
 				value: c.value,
@@ -82,8 +125,11 @@ export async function connectBrowser(): Promise<Page> {
 		);
 	}
 
-	page = await context.newPage();
-	return page;
+	const p = await ctx.newPage();
+	contexts.set(ctx, userId);
+	pages.set(p, userId);
+	lastUsed.set(userId, Date.now());
+	return p;
 }
 
 /**
@@ -292,9 +338,10 @@ export async function verifyOtp(otpCode: string): Promise<{
  * Extract auth session from browser cookies and localStorage.
  */
 async function extractSessionFromBrowser(p: Page): Promise<SnoonuSession | null> {
-	if (!context) return null;
+	const ctx = contexts.get();
+	if (!ctx) return null;
 
-	const cookies = await context.cookies();
+	const cookies = await ctx.cookies();
 
 	const deviceId = await p.evaluate(() => {
 		const raw = localStorage.getItem("deviceId");
@@ -796,13 +843,33 @@ export async function clickPlaceOrder(): Promise<{
 }
 
 /**
- * Clean up browser connection.
+ * Close the current user's browser context and page.
+ * The shared browser process stays alive for other users.
  */
 export async function closeBrowser(): Promise<void> {
+	const userId = currentUserId();
+	const ctx = contexts.has(userId) ? contexts.get(userId) : null;
+	if (ctx) {
+		await ctx.close().catch(() => {});
+	}
+	contexts.delete(userId);
+	pages.delete(userId);
+	lastUsed.delete(userId);
+}
+
+/**
+ * Tear down every user's context and the shared browser process.
+ * Call this on process shutdown only.
+ */
+export async function closeAllBrowsers(): Promise<void> {
+	for (const [userId, ctx] of contexts.entries()) {
+		if (ctx) await ctx.close().catch(() => {});
+		contexts.delete(userId);
+		pages.delete(userId);
+		lastUsed.delete(userId);
+	}
 	if (browser) {
 		await browser.close().catch(() => {});
 		browser = null;
-		context = null;
-		page = null;
 	}
 }

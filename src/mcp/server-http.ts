@@ -36,6 +36,8 @@ import {
 } from "@modelcontextprotocol/server";
 import { createSnoonuServer } from "./create-server";
 import { flush } from "./lib/store";
+import { runAsUser } from "./lib/user-context";
+import { closeAllBrowsers } from "../lib/browser";
 import {
 	handleOAuth,
 	createVerifier,
@@ -182,7 +184,6 @@ const OAUTH_ENABLED = !OAUTH_DISABLED && !ALLOW_ANONYMOUS;
 const oauthConfig = {
 	issuer: PUBLIC_BASE,
 	resource: RESOURCE_URL,
-	password: process.env.MCP_OAUTH_PASSWORD,
 };
 
 const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(
@@ -361,6 +362,32 @@ const server = Bun.serve({
 		if (bearerGate) {
 			const gate = await bearerGate(req);
 			if (gate instanceof Response) return withCors(gate, req);
+
+			// Everything downstream — session, cart, browser context — resolves
+			// through AsyncLocalStorage off this id. Without this wrapper every
+			// caller would fall back to DEFAULT_USER and share one Snoonu
+			// account, which is the whole bug this scoping exists to prevent.
+			const userId = String((gate.extra as any)?.sub ?? "");
+			if (!userId) {
+				return withCors(
+					new Response(
+						JSON.stringify({
+							jsonrpc: "2.0",
+							error: {
+								code: -32001,
+								message:
+									"Token is missing a subject; reconnect to obtain a new one.",
+							},
+							id: null,
+						}),
+						{ status: 401, headers: { "Content-Type": "application/json" } },
+					),
+					req,
+				);
+			}
+			return runAsUser(userId, async () =>
+				withCors(await handler.fetch(req), req),
+			);
 		} else if (AUTH_TOKEN) {
 			const header = req.headers.get("authorization") ?? "";
 			const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -381,7 +408,7 @@ console.error(`  MCP:     /mcp`);
 console.error(
 	`  Auth:    ${
 		OAUTH_ENABLED
-			? `OAuth 2.1 (authorization code + PKCE)${oauthConfig.password ? " + password" : ""}`
+			? "OAuth 2.1 (authorization code + PKCE), Snoonu login per user"
 			: AUTH_TOKEN
 				? "static bearer token"
 				: "ANONYMOUS (insecure)"
@@ -390,13 +417,9 @@ console.error(
 if (OAUTH_ENABLED) {
 	console.error(`  Connect: ${RESOURCE_URL}`);
 	console.error(`  Metadata:${resourceMetadataUrl}`);
-	if (!oauthConfig.password) {
-		console.error(
-			`\n  WARNING: MCP_OAUTH_PASSWORD is unset, so ANYONE who reaches the\n` +
-				`  authorize page can approve a client and shop with your Snoonu\n` +
-				`  account. Set it before exposing this publicly.`,
-		);
-	}
+	console.error(
+		`  Users:   isolated — each signs in with their own Snoonu number`,
+	);
 	if (isInsecureIssuer) {
 		console.error(
 			`\n  NOTE: issuer is http:// (${PUBLIC_BASE}). Fine locally; real clients\n` +
@@ -428,6 +451,8 @@ if (!allowedHosts) {
 
 async function shutdown(): Promise<void> {
 	await flush().catch(() => {});
+	// Tear down every user's browser context, then the shared process.
+	await closeAllBrowsers().catch(() => {});
 	await handler.close().catch(() => {});
 	await server.stop(true);
 	process.exit(0);

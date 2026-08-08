@@ -12,6 +12,7 @@ import {
 	getSession,
 	isAuthenticated,
 } from "./session-manager";
+import { PerUser } from "../mcp/lib/user-context";
 import type {
 	ApiResponse,
 	BaseProduct,
@@ -279,6 +280,7 @@ interface MarketSettingsCategory {
 	children?: Array<{ id: string; name: string }>;
 }
 
+// Public catalogue data, not user-specific — deliberately shared across all users.
 let marketCategoryCache: MarketSettingsCategory | null = null;
 
 /** Root Market category plus its subcategories. Cached — the payload is ~189KB. */
@@ -375,8 +377,8 @@ export async function searchMarket(
 // In-memory cart store — the single source of truth for cart contents.
 // multicart/sync is a FULL REPLACEMENT endpoint: sending empty items clears
 // the cart, so we must never call it to "read" — instead we track state here.
-const cartStore = new Map<string, CartItemState>();
-let cartId: string | null = null;
+const carts = new PerUser<Map<string, CartItemState>>(() => new Map());
+const cartIds = new PerUser<string | null>(() => null);
 
 /**
  * Replace the in-memory cart with a previously persisted set of items.
@@ -388,9 +390,10 @@ let cartId: string | null = null;
  * rehydrate it from disk/Redis so a cart survives across processes.
  */
 export function hydrateCart(items: CartItemState[], id?: string | null): void {
-	cartStore.clear();
-	for (const i of items) cartStore.set(i.productId, { ...i });
-	if (id !== undefined) cartId = id;
+	const store = carts.get();
+	store.clear();
+	for (const i of items) store.set(i.productId, { ...i });
+	if (id !== undefined) cartIds.set(id);
 }
 
 /** Register product details so add-to-cart can populate the in-memory store. */
@@ -403,8 +406,9 @@ export function registerProductForCart(product: {
 	isAvailable: boolean;
 }): void {
 	// Only store if not already in cart (don't overwrite quantity)
-	if (!cartStore.has(product.productId)) {
-		cartStore.set(product.productId, {
+	const store = carts.get();
+	if (!store.has(product.productId)) {
+		store.set(product.productId, {
 			...product,
 			quantity: 0,
 			totalPrice: 0,
@@ -463,7 +467,7 @@ export async function syncCart(
 	// store with the response because the API silently drops items it doesn't
 	// recognise (returns 200 + empty items). Our in-memory store is the source
 	// of truth; reconciling would wipe the cart.
-	cartId = data.data.cart_id;
+	cartIds.set(data.data.cart_id);
 
 	// Log discrepancies for debugging (stderr so it doesn't pollute MCP JSON).
 	const sentCount = items.length;
@@ -471,7 +475,7 @@ export async function syncCart(
 	if (serverCount !== sentCount) {
 		console.error(
 			`[cart] multicart/sync: sent ${sentCount} items, server accepted ${serverCount}. ` +
-			`cart_id=${cartId}, total_quantity=${data.data.total_quantity}, full_cart_price=${data.data.full_cart_price}`
+			`cart_id=${cartIds.get()}, total_quantity=${data.data.total_quantity}, full_cart_price=${data.data.full_cart_price}`
 		);
 	}
 
@@ -494,13 +498,14 @@ export async function addToCart(
 	}>
 ): Promise<CartState> {
 	// Merge into in-memory store
+	const store = carts.get();
 	for (const item of items) {
-		const existing = cartStore.get(item.productId);
+		const existing = store.get(item.productId);
 		if (existing) {
 			existing.quantity = item.quantity;
 			existing.totalPrice = existing.price * item.quantity;
 		} else {
-			cartStore.set(item.productId, {
+			store.set(item.productId, {
 				productId: item.productId,
 				merchantId: item.merchantId ?? 0,
 				name: item.name ?? item.productId,
@@ -514,7 +519,7 @@ export async function addToCart(
 	}
 
 	// Build full cart for sync (all items, not just new ones)
-	const allItems = Array.from(cartStore.values())
+	const allItems = Array.from(store.values())
 		.filter((i) => i.quantity > 0)
 		.map((i) => ({ productId: i.productId, quantity: i.quantity }));
 
@@ -526,16 +531,16 @@ export async function addToCart(
  * Never calls the API — multicart/sync with empty items clears the cart.
  */
 export function getCart(): CartState {
-	const items = Array.from(cartStore.values()).filter((i) => i.quantity > 0);
+	const items = Array.from(carts.get().values()).filter((i) => i.quantity > 0);
 	const totalQuantity = items.reduce((sum, i) => sum + i.quantity, 0);
 	const totalPrice = items.reduce((sum, i) => sum + i.totalPrice, 0);
-	return { items, totalQuantity, totalPrice, cartId };
+	return { items, totalQuantity, totalPrice, cartId: cartIds.get() };
 }
 
 /** Clear the in-memory cart and sync empty state to server. */
 export async function clearCartOnServer(): Promise<void> {
-	cartStore.clear();
-	cartId = null;
+	carts.get().clear();
+	cartIds.set(null);
 	await loadSession();
 	const headers = getApiHeaders();
 	if (!isAuthenticated()) return;

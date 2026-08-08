@@ -98,8 +98,7 @@ refuses to start unencrypted-and-open:
 
 | Variable | Purpose |
 | -------- | ------- |
-| `MCP_OAUTH_PASSWORD` | Password shown on the approval page. **Set this** — without it anyone who reaches the page can approve a client |
-| `MCP_OAUTH_SIGNING_KEY` | Signs issued tokens. Without it a restart invalidates every connection |
+| `MCP_OAUTH_SIGNING_KEY` | **Set this.** Signs tokens and seeds per-user ids; without it a restart logs everyone out |
 | `MCP_PUBLIC_URL` | Public https URL, if it can't be auto-detected |
 | `MCP_AUTH_TOKEN` | Static bearer token instead of OAuth (needs `MCP_OAUTH=off`) |
 | `ALLOW_ANONYMOUS=1` | No auth at all. Only for a genuinely private port |
@@ -112,16 +111,14 @@ refuses to start unencrypted-and-open:
 ```bash
 docker run -p 3000:3000 \
   -e HOST=0.0.0.0 \
-  -e MCP_OAUTH_PASSWORD='a-passphrase-you-choose' \
   -e MCP_OAUTH_SIGNING_KEY=$(openssl rand -hex 32) \
   mcp-server-snoonu
 ```
 
 Then add `https://your-domain/mcp` in Claude Code's connectors page and click
-Connect — the OAuth flow runs in the browser, you enter the password once, and
-the client stores its own token.
+Connect.
 
-#### OAuth
+#### OAuth and multi-user isolation
 
 The server is an OAuth 2.1 Resource Server **and** ships a small Authorization
 Server, so no third-party identity provider is needed. It implements the pieces
@@ -137,14 +134,32 @@ MCP clients actually use:
 
 Tokens are audience-bound: one minted for a different resource is rejected.
 
-> [!IMPORTANT]
-> This authorises access to **one** Snoonu session — the one on the server.
-> It is a gate in front of your own account, not multi-user identity. Anyone who
-> completes the flow shops as you, which is why `MCP_OAUTH_PASSWORD` matters.
+**Authentication is your own Snoonu login.** The consent page asks for a phone
+number, sends the normal Snoonu SMS code, and verifies it. There is no separate
+server password to invent or share — the account you're granting access to *is*
+the credential.
+
+Each person who connects gets their own isolated world, keyed off the token's
+`sub`:
+
+| State | Scope |
+| ----- | ----- |
+| Snoonu session / cookies | per user — `~/.mcp-server-snoonu/users/<id>/session.json` (0600) |
+| Cart | per user — `users/<id>/cart.json` |
+| Playwright browser context | per user (cookies, storage), sharing one Chromium process |
+| Device id sent to Snoonu | per user |
+| Product catalogue cache | **shared** — public data, same for everyone |
+
+Isolation is enforced with `AsyncLocalStorage`, so a code path that forgets to
+pass a user id is a compile error rather than a silent cross-account leak.
+Idle browser contexts are evicted after 30 minutes.
+
+The stdio server is unaffected: with no OAuth in play everything runs as the
+single local user, and an existing `~/.mcp-server-snoonu/session.json` is
+migrated into `users/local/` automatically on first run.
 
 To use an external AS (Auth0, Clerk, WorkOS…) instead, set `MCP_OAUTH=off` and
-put a reverse proxy in front, or open an issue — pointing at a third-party
-issuer is a small change.
+put a reverse proxy in front.
 
 #### Host validation, and why you probably don't need to configure it
 

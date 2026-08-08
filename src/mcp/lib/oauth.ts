@@ -12,25 +12,25 @@
  *
  * The spec models an MCP server as an OAuth *Resource Server* that points at an
  * Authorization Server through RFC 9728 Protected Resource Metadata. That
- * assumes you already run an AS. For a single-user self-hosted shopping server
- * that is absurd overhead, so this module is a small AS covering exactly the
- * flow MCP clients use:
+ * assumes you already run an AS, so this module is a small one covering exactly
+ * the flow MCP clients use:
  *
  *   authorization code + PKCE (S256 required), RFC 8707 resource binding,
  *   RFC 8414 AS metadata, and open registration for public clients.
  *
- * Point MCP_OAUTH_ISSUER at an external AS instead and this is bypassed
- * entirely — see server-http.ts.
- *
- * SCOPE OF TRUST
- * --------------
- * This authorises access to ONE Snoonu session — the one on this host. It is a
- * gate in front of your own account, not a multi-tenant identity system.
- * Approval is therefore a single shared passphrase (MCP_OAUTH_PASSWORD).
+ * IDENTITY
+ * --------
+ * The resource being protected IS a Snoonu account, so the Snoonu login is the
+ * authentication: phone number → SMS OTP. No invented password, and no shared
+ * account — each person signs in as themselves, the token's `sub` is derived
+ * from their number, and every downstream call runs scoped to that user with
+ * their own session, cart, and browser context.
  */
 
 import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
+import { runAsUser } from "./user-context";
+import { requestOtp, verifyOtp } from "../../lib/browser";
 
 /**
  * The SDK maps OAuthError -> 401/403 with the WWW-Authenticate challenge.
@@ -52,7 +52,10 @@ if (!process.env.MCP_OAUTH_SIGNING_KEY) {
 	console.error(
 		"[oauth] MCP_OAUTH_SIGNING_KEY not set — generated an ephemeral key.\n" +
 			"        Issued tokens become invalid on restart, and replicas will\n" +
-			"        reject each other's tokens. Set it to persist sessions:\n" +
+			"        reject each other's tokens.\n" +
+			"        It also seeds the per-user id derived from a phone number, so\n" +
+			"        restarting orphans every user's saved Snoonu session and they\n" +
+			"        must sign in again. Set it:\n" +
 			"          MCP_OAUTH_SIGNING_KEY=$(openssl rand -hex 32)",
 	);
 }
@@ -144,21 +147,81 @@ interface PendingCode {
 	codeChallenge: string;
 	resource: string;
 	scope: string;
+	/** The Snoonu account this code (and the resulting token) acts on. */
+	userId: string;
 	expiresAt: number;
 }
 
 const codes = new Map<string, PendingCode>();
 const clients = new Map<string, { redirectUris: string[]; name?: string }>();
 
+// ---------------------------------------------------------------------------
+// Authentication: the user's own Snoonu login
+// ---------------------------------------------------------------------------
+
+/**
+ * OAuth requires the Authorization Server to authenticate the resource owner
+ * before issuing a code — otherwise /oauth/authorize hands tokens to anyone who
+ * finds the URL. Normally that step is "log in with Google".
+ *
+ * Here the resource IS a Snoonu account, so the authentication is the Snoonu
+ * login itself: phone number → SMS OTP. That is strictly better than a
+ * server-wide password, because it both proves identity AND establishes *which*
+ * account this token may act on. Every user authenticates as themselves and
+ * gets their own isolated session — no shared account, no invented secret.
+ *
+ * The OAuth `sub` is derived from the phone number, so the same person
+ * reconnecting resumes their own session.
+ */
+const LOGIN_TTL_MS = 10 * 60 * 1000;
+
+interface PendingLogin {
+	phone: string;
+	/** Carried through the OTP step so the redirect can be completed after. */
+	params: Record<string, string>;
+	expiresAt: number;
+}
+
+const logins = new Map<string, PendingLogin>();
+
+/** Stable, non-reversible user id for a phone number. */
+export function userIdForPhone(phone: string): string {
+	const digits = phone.replace(/\D/g, "");
+	return `snoonu_${createHash("sha256")
+		.update(`${digits}:${SIGNING_KEY}`)
+		.digest("hex")
+		.slice(0, 24)}`;
+}
+
 function sweep(): void {
 	const now = Date.now();
 	for (const [k, v] of codes) if (v.expiresAt < now) codes.delete(k);
+	for (const [k, v] of logins) if (v.expiresAt < now) logins.delete(k);
+}
+
+/**
+ * Mint an authorization code for an already-authenticated user.
+ *
+ * Split out of the authorize handler so the token exchange can be tested
+ * without driving a real SMS OTP. This is not a bypass: it takes an already
+ * proven userId, and nothing routes to it except the post-OTP path and tests.
+ */
+export function issueAuthorizationCode(params: {
+	clientId: string;
+	redirectUri: string;
+	codeChallenge: string;
+	resource: string;
+	scope: string;
+	userId: string;
+}): string {
+	const code = randomBytes(32).toString("base64url");
+	codes.set(code, { ...params, expiresAt: Date.now() + CODE_TTL_MS });
+	return code;
 }
 
 export interface OAuthConfig {
 	issuer: string;
 	resource: string;
-	password?: string;
 }
 
 export const SUPPORTED_SCOPES = ["snoonu:read", "snoonu:write"];
@@ -202,6 +265,15 @@ code{background:#1e1e22;padding:.1rem .35rem;border-radius:4px;font-size:.82rem}
 </style></head><body><div class="card">${body}</div></body></html>`,
 		{ status, headers: { "Content-Type": "text/html; charset=utf-8" } },
 	);
+}
+
+/** Escape untrusted text before putting it in the approval pages. */
+function escapeHtml(v: string): string {
+	return v
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
 }
 
 function oauthError(error: string, description: string, status = 400): Response {
@@ -291,55 +363,132 @@ export async function handleOAuth(
 			);
 		}
 
+		const carried = {
+			client_id: clientId,
+			redirect_uri: redirectUri,
+			state,
+			code_challenge: challenge,
+			code_challenge_method: method,
+			resource,
+			scope,
+		};
+		const hidden = (extra: Record<string, string> = {}) =>
+			Object.entries({ ...carried, ...extra })
+				.map(
+					([k, v]) =>
+						`<input type="hidden" name="${k}" value="${String(v).replace(/"/g, "&quot;")}">`,
+				)
+				.join("");
+
+		// Step 1 — ask for the phone number.
 		if (req.method === "GET") {
-			const needsPassword = Boolean(cfg.password);
 			return html(`
-				<h1>Connect to your Snoonu account</h1>
+				<h1>Sign in to Snoonu</h1>
 				<p>An MCP client wants to search, manage your cart, and check out on
-				   your behalf, using the Snoonu session on this server.</p>
+				   your behalf. Sign in with your own Snoonu account — you get your
+				   own private session and cart.</p>
 				<p class="warn"><strong>This grants the ability to place real orders
-				   and spend real money.</strong> Only approve a client you started.</p>
+				   and spend real money.</strong> Only continue if you started this.</p>
 				<form method="POST">
-					${Object.entries({ client_id: clientId, redirect_uri: redirectUri, state, code_challenge: challenge, code_challenge_method: method, resource, scope })
-						.map(
-							([k, v]) =>
-								`<input type="hidden" name="${k}" value="${String(v).replace(/"/g, "&quot;")}">`,
-						)
-						.join("")}
-					${needsPassword ? `<input type="password" name="password" placeholder="Server password" autofocus required>` : ""}
-					<button type="submit">Approve access</button>
+					${hidden({ step: "phone" })}
+					<input name="phone" inputmode="tel" autocomplete="tel"
+					       placeholder="Phone number (e.g. 55123456)" autofocus required>
+					<button type="submit">Send code</button>
 				</form>`);
 		}
 
 		if (req.method === "POST") {
-			if (cfg.password) {
-				const given = param("password");
-				const a = Buffer.from(given);
-				const b = Buffer.from(cfg.password);
-				if (a.length !== b.length || !timingSafeEqual(a, b)) {
+			const step = param("step");
+
+			// Step 2 — trigger the Snoonu OTP for that number.
+			if (step === "phone") {
+				const phone = param("phone").trim();
+				if (!/^\d{6,15}$/.test(phone.replace(/\D/g, ""))) {
 					return html(
-						`<h1>Incorrect password</h1><p>Go back and try again.</p>`,
-						401,
+						`<h1>Invalid number</h1><p>Enter a Qatar mobile number without the country code, e.g. <code>55123456</code>.</p>`,
+						400,
 					);
 				}
+
+				const userId = userIdForPhone(phone);
+				// Drive the login inside that user's own context, so the OTP and
+				// the resulting cookies land in their session, not a shared one.
+				const result = await runAsUser(userId, () => requestOtp(phone));
+				if (!result.success) {
+					return html(
+						`<h1>Could not send the code</h1><p>${escapeHtml(result.message)}</p>
+						 <p><a href="${escapeHtml(url.pathname + url.search)}">Try again</a></p>`,
+						502,
+					);
+				}
+
+				const loginId = randomBytes(24).toString("base64url");
+				logins.set(loginId, {
+					phone,
+					params: carried,
+					expiresAt: Date.now() + LOGIN_TTL_MS,
+				});
+
+				return html(`
+					<h1>Enter your code</h1>
+					<p>We sent a 6-digit code to <strong>${escapeHtml(phone)}</strong>.</p>
+					<form method="POST">
+						${hidden({ step: "otp", login_id: loginId })}
+						<input name="otp" inputmode="numeric" autocomplete="one-time-code"
+						       placeholder="6-digit code" autofocus required>
+						<button type="submit">Verify and connect</button>
+					</form>`);
 			}
 
-			const code = randomBytes(32).toString("base64url");
-			codes.set(code, {
-				clientId,
-				redirectUri,
-				codeChallenge: challenge,
-				resource,
-				scope,
-				expiresAt: Date.now() + CODE_TTL_MS,
-			});
+			// Step 3 — verify the OTP, then issue the authorization code.
+			if (step === "otp") {
+				const loginId = param("login_id");
+				const pending = logins.get(loginId);
+				if (!pending || pending.expiresAt < Date.now()) {
+					logins.delete(loginId);
+					return html(
+						`<h1>Session expired</h1><p>Start the connection again from your MCP client.</p>`,
+						400,
+					);
+				}
 
-			const target = new URL(redirectUri);
-			target.searchParams.set("code", code);
-			if (state) target.searchParams.set("state", state);
-			// RFC 9207 — let the client pin the issuer.
-			target.searchParams.set("iss", cfg.issuer);
-			return Response.redirect(target.toString(), 302);
+				const otp = param("otp").trim();
+				const userId = userIdForPhone(pending.phone);
+				const verified = await runAsUser(userId, () => verifyOtp(otp));
+
+				if (!verified.loggedIn) {
+					return html(`
+						<h1>That code didn't work</h1>
+						<p>${escapeHtml(verified.message)}</p>
+						<form method="POST">
+							${hidden({ step: "otp", login_id: loginId })}
+							<input name="otp" inputmode="numeric" placeholder="6-digit code" autofocus required>
+							<button type="submit">Try again</button>
+						</form>`);
+				}
+
+				logins.delete(loginId);
+
+				// Binds the token — and therefore every downstream session,
+				// cart, and browser context — to THIS Snoonu account.
+				const code = issueAuthorizationCode({
+					clientId,
+					redirectUri,
+					codeChallenge: challenge,
+					resource,
+					scope,
+					userId,
+				});
+
+				const target = new URL(redirectUri);
+				target.searchParams.set("code", code);
+				if (state) target.searchParams.set("state", state);
+				// RFC 9207 — let the client pin the issuer.
+				target.searchParams.set("iss", cfg.issuer);
+				return Response.redirect(target.toString(), 302);
+			}
+
+			return html(`<h1>Unexpected step</h1><p>Start again from your MCP client.</p>`, 400);
 		}
 	}
 
@@ -390,7 +539,7 @@ export async function handleOAuth(
 
 		const now = Math.floor(Date.now() / 1000);
 		const access = sign({
-			sub: "snoonu-host",
+			sub: pending.userId,
 			aud: audience,
 			iss: cfg.issuer,
 			client_id: pending.clientId,

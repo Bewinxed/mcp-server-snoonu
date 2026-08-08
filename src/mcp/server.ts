@@ -18,12 +18,14 @@
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createSnoonuServer } from "./create-server";
 import { flush } from "./lib/store";
+import { closeAllBrowsers } from "../lib/browser";
 
 const handle = await serveStdio(createSnoonuServer);
 
 async function shutdown(): Promise<void> {
 	// Flush pending store writes so a cart mutation isn't lost on exit.
 	await flush().catch(() => {});
+	await closeAllBrowsers().catch(() => {});
 	await handle.close().catch(() => {});
 	process.exit(0);
 }

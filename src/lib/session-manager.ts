@@ -6,15 +6,58 @@
  * Provides headers for direct API calls.
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+	PerUser,
+	currentUserId,
+	userSlug,
+	DEFAULT_USER,
+} from "../mcp/lib/user-context";
 
 const SESSION_DIR = join(homedir(), ".mcp-server-snoonu");
-const SESSION_FILE = join(SESSION_DIR, "session.json");
+/** Pre-multi-user location. Migrated into users/local/ on first read. */
+const LEGACY_SESSION_FILE = join(SESSION_DIR, "session.json");
 
-async function ensureDir(): Promise<void> {
-	await mkdir(SESSION_DIR, { recursive: true });
+/**
+ * Each authenticated user gets their own directory. Sessions are real
+ * credentials for a real Snoonu account, so they are never shared between
+ * users and the directory is created 0700 / files 0600.
+ */
+function userDir(userId = currentUserId()): string {
+	return join(SESSION_DIR, "users", userSlug(userId));
+}
+
+function sessionFile(userId = currentUserId()): string {
+	return join(userDir(userId), "session.json");
+}
+
+async function ensureDir(userId = currentUserId()): Promise<void> {
+	await mkdir(userDir(userId), { recursive: true, mode: 0o700 });
+}
+
+/**
+ * Move a pre-multi-user session.json into users/local/ once, so an existing
+ * local install keeps working after upgrading.
+ */
+let migrated = false;
+async function migrateLegacyLayout(): Promise<void> {
+	if (migrated) return;
+	migrated = true;
+	if (!existsSync(LEGACY_SESSION_FILE)) return;
+	const target = sessionFile(DEFAULT_USER);
+	if (existsSync(target)) return;
+	try {
+		await mkdir(userDir(DEFAULT_USER), { recursive: true, mode: 0o700 });
+		await rename(LEGACY_SESSION_FILE, target);
+		console.error(
+			`[session] migrated ${LEGACY_SESSION_FILE} -> ${target} for per-user isolation`,
+		);
+	} catch (err) {
+		console.error("[session] legacy migration failed:", (err as Error).message);
+	}
 }
 
 export interface SnoonuSession {
@@ -47,43 +90,61 @@ const DEFAULT_LOCATION = {
 	address: "Doha, Qatar",
 };
 
-const DEFAULT_DEVICE_ID = `web-${crypto.randomUUID().replace(/-/g, "")}`;
+/**
+ * Snoonu identifies a client by device id, so users must not share one. This
+ * used to be a single module-level constant, which meant every user without a
+ * stored session presented the same device to Snoonu — inviting cross-user
+ * rate-limiting and fraud heuristics. One stable id per user instead.
+ */
+const deviceIds = new PerUser<string>(
+	() => `web-${crypto.randomUUID().replace(/-/g, "")}`,
+);
+const defaultDeviceId = (): string => deviceIds.get();
 
-let cachedSession: SnoonuSession | null = null;
+/**
+ * One cached session per user. Was a single module-level `cachedSession`,
+ * which meant every HTTP caller shared one Snoonu account.
+ */
+const sessionCache = new PerUser<SnoonuSession | null>(() => null);
 
 /**
  * Load session from disk. Returns null if no valid session exists.
  */
 export async function loadSession(): Promise<SnoonuSession | null> {
-	if (cachedSession) return cachedSession;
+	const userId = currentUserId();
+	const cached = sessionCache.get(userId);
+	if (cached) return cached;
+
+	if (userId === DEFAULT_USER) await migrateLegacyLayout();
 
 	try {
-		const raw = JSON.parse(await readFile(SESSION_FILE, "utf-8"));
+		const raw = JSON.parse(await readFile(sessionFile(userId), "utf-8"));
 
 		// Validate minimum required fields
 		if (!raw.authToken && !raw.deviceId) {
 			// Try to extract from old format (cookies array + localStorage)
 			const session = migrateOldSession(raw);
 			if (session) {
-				cachedSession = session;
+				sessionCache.set(session, userId);
 				return session;
 			}
 			return null;
 		}
 
-		cachedSession = raw as SnoonuSession;
+		const session = raw as SnoonuSession;
 
 		// If location is default but we have a locationToken, parse real coordinates
 		if (
-			cachedSession.locationToken &&
-			cachedSession?.location?.latitude === DEFAULT_LOCATION.latitude &&
-			cachedSession?.location?.longitude === DEFAULT_LOCATION.longitude
+			session.locationToken &&
+			session?.location?.latitude === DEFAULT_LOCATION.latitude &&
+			session?.location?.longitude === DEFAULT_LOCATION.longitude
 		) {
-			const parsed = parseLocationToken(cachedSession.locationToken);
-			if (parsed) cachedSession.location = parsed;
+			const parsed = parseLocationToken(session.locationToken);
+			if (parsed) session.location = parsed;
 		}
 
-		return cachedSession;
+		sessionCache.set(session, userId);
+		return session;
 	} catch {
 		return null;
 	}
@@ -111,7 +172,7 @@ function migrateOldSession(raw: any): SnoonuSession | null {
 		let deviceId =
 			localStorage.deviceId ||
 			localStorage["snoonu-app-device-id"] ||
-			DEFAULT_DEVICE_ID;
+			defaultDeviceId();
 
 		// Old format sometimes wraps in JSON quotes
 		if (deviceId.startsWith('"')) {
@@ -142,20 +203,25 @@ function migrateOldSession(raw: any): SnoonuSession | null {
  * Save session to disk.
  */
 export async function saveSession(session: SnoonuSession): Promise<void> {
+	const userId = currentUserId();
 	session.savedAt = new Date().toISOString();
-	cachedSession = session;
-	await ensureDir();
-	await writeFile(SESSION_FILE, JSON.stringify(session, null, 2), "utf-8");
+	sessionCache.set(session, userId);
+	await ensureDir(userId);
+	await writeFile(sessionFile(userId), JSON.stringify(session, null, 2), {
+		encoding: "utf-8",
+		mode: 0o600,
+	});
 }
 
 /**
- * Clear saved session.
+ * Clear the current user's saved session. Removes the file rather than
+ * blanking it, so no residue of one user's credentials is left on disk.
  */
 export async function clearSession(): Promise<void> {
-	cachedSession = null;
+	const userId = currentUserId();
+	sessionCache.delete(userId);
 	try {
-		await ensureDir();
-		await writeFile(SESSION_FILE, "{}", "utf-8");
+		await rm(sessionFile(userId), { force: true });
 	} catch {}
 }
 
@@ -198,9 +264,10 @@ export async function updateSessionFromBrowser(
 
 	const session: SnoonuSession = {
 		authToken: authCookie?.value || "",
-		deviceId: deviceId || cachedSession?.deviceId || DEFAULT_DEVICE_ID,
+		deviceId: deviceId || sessionCache.get()?.deviceId || defaultDeviceId(),
 		locationToken: locationCookie?.value || "",
-		location: location || parsedLocation || cachedSession?.location || DEFAULT_LOCATION,
+		location:
+			location || parsedLocation || sessionCache.get()?.location || DEFAULT_LOCATION,
 		cookies,
 		savedAt: new Date().toISOString(),
 	};
@@ -213,25 +280,25 @@ export async function updateSessionFromBrowser(
  * Check if current session has a valid auth token.
  */
 export function isAuthenticated(): boolean {
-	return !!cachedSession?.authToken;
+	return !!sessionCache.get()?.authToken;
 }
 
 /**
  * Get current session (may be null).
  */
 export function getSession(): SnoonuSession | null {
-	return cachedSession;
+	return sessionCache.get();
 }
 
 /**
  * Generate headers required for Snoonu API calls.
  */
 export function getApiHeaders(session?: SnoonuSession | null): Record<string, string> {
-	const s = session || cachedSession;
+	const s = session || sessionCache.get();
 
 	const latitude = s?.location?.latitude || DEFAULT_LOCATION.latitude;
 	const longitude = s?.location?.longitude || DEFAULT_LOCATION.longitude;
-	const deviceId = s?.deviceId || DEFAULT_DEVICE_ID;
+	const deviceId = s?.deviceId || defaultDeviceId();
 
 	if (!latitude) console.error("[session] WARNING: latitude resolved to empty string — API calls will return empty results");
 	if (!longitude) console.error("[session] WARNING: longitude resolved to empty string — API calls will return empty results");
@@ -255,5 +322,5 @@ export function getApiHeaders(session?: SnoonuSession | null): Record<string, st
  * Get the session file path (for external tools that need it).
  */
 export function getSessionPath(): string {
-	return SESSION_FILE;
+	return sessionFile();
 }

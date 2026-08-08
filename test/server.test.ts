@@ -10,12 +10,9 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { rm } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 const OFFLINE = process.env.SNOONU_OFFLINE === "1";
-const STORE = join(homedir(), ".mcp-server-snoonu", "store.json");
 
 function connect(): Promise<Client> {
 	const transport = new StdioClientTransport({
