@@ -76,8 +76,8 @@ export async function loadSession(): Promise<SnoonuSession | null> {
 		// If location is default but we have a locationToken, parse real coordinates
 		if (
 			cachedSession.locationToken &&
-			cachedSession.location.latitude === DEFAULT_LOCATION.latitude &&
-			cachedSession.location.longitude === DEFAULT_LOCATION.longitude
+			cachedSession?.location?.latitude === DEFAULT_LOCATION.latitude &&
+			cachedSession?.location?.longitude === DEFAULT_LOCATION.longitude
 		) {
 			const parsed = parseLocationToken(cachedSession.locationToken);
 			if (parsed) cachedSession.location = parsed;
@@ -229,14 +229,22 @@ export function getSession(): SnoonuSession | null {
 export function getApiHeaders(session?: SnoonuSession | null): Record<string, string> {
 	const s = session || cachedSession;
 
+	const latitude = s?.location?.latitude || DEFAULT_LOCATION.latitude;
+	const longitude = s?.location?.longitude || DEFAULT_LOCATION.longitude;
+	const deviceId = s?.deviceId || DEFAULT_DEVICE_ID;
+
+	if (!latitude) console.error("[session] WARNING: latitude resolved to empty string — API calls will return empty results");
+	if (!longitude) console.error("[session] WARNING: longitude resolved to empty string — API calls will return empty results");
+	if (!deviceId) console.error("[session] WARNING: device id resolved to empty string — API calls will return empty results");
+
 	return {
 		accept: "*/*",
 		"content-type": "application/json",
 		appversion: "2",
 		language: "en",
-		latitude: s?.location.latitude || DEFAULT_LOCATION.latitude,
-		longitude: s?.location.longitude || DEFAULT_LOCATION.longitude,
-		"snoonu-app-device-id": s?.deviceId || DEFAULT_DEVICE_ID,
+		latitude,
+		longitude,
+		"snoonu-app-device-id": deviceId,
 		"snoonu-app-platform": "Web",
 		"snoonu-app-version": "65535.65535.65535.65535",
 		token: s?.authToken || "",

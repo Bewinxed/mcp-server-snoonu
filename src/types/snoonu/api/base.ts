@@ -116,4 +116,4 @@ export interface SubscriptionBenefits {
 	};
 }
 
-export type MerchantStatus = "open" | "closed" | "available_for_scheduled_delivery";
+export type MerchantStatus = "open" | "closed" | "busy" | "one_hour_left" | "available_for_scheduled_delivery";

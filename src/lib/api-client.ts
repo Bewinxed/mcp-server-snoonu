@@ -13,12 +13,12 @@ import {
 	isAuthenticated,
 } from "./session-manager";
 import type {
+	ApiResponse,
+	BaseProduct,
 	GlobalSearchRequest,
 	GlobalSearchResponse,
 	GlobalSearchMerchant,
 	GlobalSearchProduct,
-	SuggestInMerchantRequest,
-	SuggestInMerchantResponse,
 	MulticartSyncRequest,
 	MulticartSyncResponse,
 	SavedAddressesResponse,
@@ -28,12 +28,24 @@ import type {
 const SNOONU_API_BASE = "https://admin.snoonu.com/api";
 const SNOOMARKET_API_BASE = "https://snoomarket-web.snoonu.com/api";
 
+/**
+ * Category ids accepted by /v5/search/global, verified live against
+ * POST /api/v3/category_list.
+ *
+ * "Market" (3895) is deliberately absent. It is the only category with
+ * navigation_type: 1 — the snoomarket vertical, served by
+ * snoomarket-web.snoonu.com, not by global search. Passing 3895 here is
+ * indistinguishable from passing garbage: it returned 0 merchants for every
+ * query tested, exactly like category_id=999999.
+ */
 export const SNOONU_CATEGORIES = {
 	Restaurants: 62,
 	Groceries: 3,
-	Market: 3895,
 	Pharmacy: 129,
-	Flowers: 65,
+	"Flowers & Gifts": 65,
+	Charity: 4649,
+	Tamwin: 5863,
+	Services: 6582,
 } as const;
 
 export type CategoryName = keyof typeof SNOONU_CATEGORIES;
@@ -49,7 +61,7 @@ export interface MerchantResult {
 	id: number;
 	name: string;
 	englishName: string;
-	menuId: number;
+	branchId: string;
 	url: string | null;
 	distance: number;
 	minEta: number;
@@ -57,6 +69,7 @@ export interface MerchantResult {
 	averagePreparationTime: number;
 	isFreeDeliveryEligible: boolean;
 	isOpen: boolean;
+	acceptsScheduledOrders: boolean;
 	products: ProductResult[];
 }
 
@@ -110,19 +123,19 @@ export async function searchProducts(
 	await loadSession();
 	const headers = getApiHeaders();
 
-	const {
-		category = "Groceries",
-		page = 0,
-		pageSize = 20,
-		productSize = 20,
-	} = options;
+	const { category, page = 0, pageSize = 20, productSize = 20 } = options;
 
+	// category_id is now OPT-IN. It used to default to Groceries (3) on every
+	// call, which silently filtered out anything non-grocery — "running shoes"
+	// returned zero merchants. snoonu.com itself sends no category_id when you
+	// search from the header, and omitting it returns the same results as
+	// category_id=3 for grocery terms while also matching everything else.
 	const params: GlobalSearchRequest = {
 		page,
 		page_size: pageSize,
 		product_size: productSize,
 		term: query,
-		category_id: SNOONU_CATEGORIES[category],
+		...(category ? { category_id: SNOONU_CATEGORIES[category] } : {}),
 	};
 
 	const url = new URL(`${SNOONU_API_BASE}/v5/search/global`);
@@ -139,42 +152,55 @@ export async function searchProducts(
 
 	return {
 		query,
-		merchants: data.data.merchants.map((m) => mapMerchant(m, query)),
+		merchants: data.data.merchants.map((m) => mapMerchant(m, query, category)),
 	};
 }
 
 // ---------- Search in Merchant ----------
 
+interface MultiSearchInMerchantRequest {
+	branch_id: string;
+	device_id: string;
+	terms: string[];
+}
+
+type MultiSearchInMerchantResponse = ApiResponse<
+	Array<{ term: string; product_view_models: BaseProduct[] }>
+>;
+
 export async function searchInMerchant(
-	merchantId: number,
-	menuId: number,
-	query: string
+	branchId: string,
+	query: string,
 ): Promise<ProductResult[]> {
 	await loadSession();
 	const headers = getApiHeaders();
 
-	const body: SuggestInMerchantRequest = {
-		language: "en",
-		menu_id: menuId,
-		term: query,
+	const body: MultiSearchInMerchantRequest = {
+		branch_id: branchId,
+		device_id: headers["snoonu-app-device-id"]!,
+		terms: [query],
 	};
 
 	const res = await fetch(
-		`${SNOONU_API_BASE}/search/suggest_in_merchant_with_subcategory`,
+		`${SNOONU_API_BASE}/v5/search/multi_search_in_merchant`,
 		{
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
-		}
+		},
 	);
-	const data: SuggestInMerchantResponse = await res.json();
+	const data: MultiSearchInMerchantResponse = await res.json();
 
-	if (!data.data?.product_view_models) return [];
+	if (!data.is_success || !data.data) {
+		throw new Error(data.error?.message || "Search in merchant failed");
+	}
 
-	return data.data.product_view_models
+	const products = data.data[0]?.product_view_models ?? [];
+
+	return products
 		.filter((p) => p.is_instock && p.is_available)
 		.map((p) => ({
-			id: p.object_id,
+			id: p.object_id || p.product_id,
 			productId: p.product_id,
 			merchantId: p.merchant_id,
 			name: p.name,
@@ -190,6 +216,158 @@ export async function searchInMerchant(
 			relevanceScore: calculateRelevance(p.name, query),
 			raw: p as unknown as GlobalSearchProduct,
 		}));
+}
+
+// ---------- Product Details ----------
+
+type ProductDetailResponse = ApiResponse<BaseProduct & Record<string, unknown>>;
+
+export async function fetchProductById(
+	productId: string,
+	branchId: string,
+): Promise<ProductResult> {
+	await loadSession();
+	const headers = getApiHeaders();
+
+	const res = await fetch(
+		`${SNOONU_API_BASE}/v7/products/${encodeURIComponent(productId)}?branch_id=${encodeURIComponent(branchId)}`,
+		{ headers },
+	);
+	const data: ProductDetailResponse = await res.json();
+
+	if (!data.is_success || !data.data) {
+		throw new Error(data.error?.message || "Failed to fetch product");
+	}
+
+	const p = data.data;
+	return {
+		id: p.object_id || p.product_id,
+		productId: p.product_id,
+		merchantId: p.merchant_id,
+		name: p.name,
+		englishName: p.english_name,
+		description: p.description,
+		imageUrl: p.image_url,
+		price: parseFloat(p.price),
+		originalPrice: p.price_old ? parseFloat(p.price_old) : null,
+		discountPercentage: p.discount_percentage,
+		isInStock: p.is_instock,
+		isAvailable: p.is_available,
+		stockCount: p.stock_count,
+		relevanceScore: null,
+		raw: p as unknown as GlobalSearchProduct,
+	};
+}
+
+// ---------- Snoomarket (the "Market" vertical) ----------
+
+/**
+ * Market is category 3895 with navigation_type: 1 — a separate vertical served
+ * by snoomarket-web.snoonu.com. /v5/search/global returns 0 merchants for it no
+ * matter the query, which is why "Market" searches silently came back empty.
+ *
+ * Note the endpoint is v3, not v4: v4's search_dynamic_content accepts the
+ * request and returns 200, but IGNORES search_term — "milk", "iphone" and
+ * "zzzqqqxyz" all return byte-identical category feeds. v3 actually searches.
+ * The field is snake_case (`market_place_category_id`); camelCase yields a 400.
+ */
+const SNOOMARKET_ROOT_CATEGORY_ID = "6544e4cf116503eb3f28a09b";
+
+interface MarketSettingsCategory {
+	id: string;
+	name: string;
+	children?: Array<{ id: string; name: string }>;
+}
+
+let marketCategoryCache: MarketSettingsCategory | null = null;
+
+/** Root Market category plus its subcategories. Cached — the payload is ~189KB. */
+export async function getMarketCategories(): Promise<MarketSettingsCategory> {
+	if (marketCategoryCache) return marketCategoryCache;
+	await loadSession();
+	const headers = getApiHeaders();
+
+	try {
+		const res = await fetch(
+			`${SNOOMARKET_API_BASE}/v1/marketplace/web/settings`,
+			{ headers },
+		);
+		const data = await res.json();
+		const root = data?.data?.market_place_categories;
+		if (root?.id) {
+			marketCategoryCache = root as MarketSettingsCategory;
+			return marketCategoryCache;
+		}
+	} catch {
+		// fall through to the hardcoded root
+	}
+	marketCategoryCache = { id: SNOOMARKET_ROOT_CATEGORY_ID, name: "Market", children: [] };
+	return marketCategoryCache;
+}
+
+/** Search the Snoomarket catalogue. Works anonymously. */
+export async function searchMarket(
+	query: string,
+	options: { categoryId?: string; page?: number; pageSize?: number } = {},
+): Promise<ProductResult[]> {
+	await loadSession();
+	const headers = getApiHeaders();
+
+	const body = {
+		market_place_category_id: options.categoryId ?? SNOOMARKET_ROOT_CATEGORY_ID,
+		search_term: query,
+		endless_product_block_size: options.pageSize ?? 20,
+		page_size: 1,
+		offset: options.page ?? 0,
+	};
+
+	const res = await fetch(
+		`${SNOOMARKET_API_BASE}/v3/marketplace/category/dynamic_content`,
+		{ method: "POST", headers, body: JSON.stringify(body) },
+	);
+
+	if (!res.ok) {
+		throw new Error(
+			`Market search failed (HTTP ${res.status}). Required headers are ` +
+				`snoonu-app-device-id, snoonu-app-version and snoonu-app-platform.`,
+		);
+	}
+
+	const data = await res.json();
+	const blocks: any[] = data?.data?.blocks ?? [];
+	const products: any[] = blocks
+		.flatMap((b) => b?.body?.items ?? [])
+		.map((i) => i?.product)
+		.filter(Boolean);
+
+	return products
+		.filter((p) => p.is_instock && p.is_available)
+		.map((p) => {
+			const price = parseFloat(p.price);
+			const originalPrice = p.price_old ? parseFloat(p.price_old) : null;
+			return {
+				// `id` is ALWAYS 0 on marketplace products — never key off it.
+				id: p.object_id || p.product_id,
+				productId: p.product_id,
+				merchantId: p.merchant_id,
+				name: p.name,
+				englishName: p.english_name,
+				description: p.description ?? null,
+				imageUrl: p.image_url,
+				price,
+				originalPrice,
+				// discount_percentage is not returned here; derive it.
+				discountPercentage:
+					originalPrice && originalPrice > price
+						? Math.round(((originalPrice - price) / originalPrice) * 100)
+						: null,
+				isInStock: p.is_instock,
+				isAvailable: p.is_available,
+				stockCount: p.stock_count ?? 0,
+				relevanceScore: calculateRelevance(p.name, query),
+				raw: p as unknown as GlobalSearchProduct,
+			} satisfies ProductResult;
+		});
 }
 
 // ---------- Cart ----------
@@ -466,22 +644,49 @@ function locationTypeLabel(type: number): string {
 
 // ---------- Helpers ----------
 
-function mapMerchant(merchant: GlobalSearchMerchant, query: string): MerchantResult {
+/**
+ * Map a category name to the URL slug used on snoonu.com.
+ * The merchant's numeric `vertical` field is NOT reliable for this purpose —
+ * e.g. vertical=1 serves under /groceries/ for non-pharmacy merchants — so we
+ * only derive a URL when the search category is known.
+ */
+const CATEGORY_SLUGS: Record<string, string> = {
+	Restaurants: "restaurants",
+	Groceries: "groceries",
+	Pharmacy: "pharmacy",
+};
+
+function merchantUrl(
+	urlFriendlyName: string | undefined,
+	category?: CategoryName,
+): string | null {
+	if (!urlFriendlyName) return null;
+	const slug = category && CATEGORY_SLUGS[category];
+	if (!slug) return null;
+	return `/${slug}/${urlFriendlyName}`;
+}
+
+function mapMerchant(
+	merchant: GlobalSearchMerchant,
+	query: string,
+	category?: CategoryName,
+): MerchantResult {
+	const status = merchant.info_merchant.status.toLowerCase();
 	return {
 		id: merchant.id,
 		name: merchant.name,
 		englishName: merchant.english_name,
-		menuId: merchant.menu_id,
-		url: merchant.url_friendly_name
-			? `/en/merchant/${merchant.url_friendly_name}`
-			: null,
+		branchId: merchant.branch_id,
+		url: merchantUrl(merchant.url_friendly_name, category),
 		distance: merchant.distance,
 		minEta: merchant.min_eta,
 		rating: merchant.rating,
 		averagePreparationTime: merchant.average_preparation_time,
 		isFreeDeliveryEligible:
 			merchant.subscription_benefits.s_plus.is_free_delivery_eligible,
-		isOpen: merchant.info_merchant.status.toLowerCase() === "open",
+		isOpen: status === "open" || status === "one_hour_left",
+		acceptsScheduledOrders:
+			status === "busy" || status === "available_for_scheduled_delivery",
 		products: merchant.products
 			.filter((p) => p.is_instock && p.is_available)
 			.map((p) => mapProduct(p, query)),

@@ -46,7 +46,7 @@ export interface ProductRecord {
 	price: number;
 	merchantId: number;
 	merchantName: string;
-	menuId?: number;
+	branchId?: string;
 	imageUrl?: string;
 	description?: string;
 	isInStock?: boolean;

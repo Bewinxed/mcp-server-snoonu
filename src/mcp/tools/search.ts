@@ -17,8 +17,9 @@
  *
  * Product metadata discovered here is written to the persistent store
  * (../lib/store) rather than a module-level Map, so that a product id handed to
- * the model in one process still resolves in the next. Snoonu has no
- * fetch-by-id endpoint, so remembering is the only way to resolve an id later.
+ * the model in one process still resolves in the next. Products can also be
+ * fetched live via GET /api/v7/products/{id}?branch_id={branch_id} when the
+ * store misses and a branch_id is available.
  */
 
 import { z } from "zod";
@@ -26,6 +27,8 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import {
 	searchProducts,
 	searchInMerchant,
+	searchMarket,
+	fetchProductById,
 	type CategoryName,
 	type ProductResult,
 	type MerchantResult,
@@ -34,12 +37,45 @@ import { ok, fail } from "../lib/result";
 import { putProducts, getProduct, type ProductRecord } from "../lib/store";
 
 const CATEGORIES = [
-	"Groceries",
 	"Restaurants",
+	"Groceries",
 	"Pharmacy",
+	"Flowers & Gifts",
+	"Charity",
+	"Tamwin",
+	"Services",
+	// Market is NOT a /v5/search/global category — it routes to Snoomarket.
 	"Market",
-	"Flowers",
 ] as const;
+
+/**
+ * Market lives on a different host and has no merchant/branch layer, so it is
+ * handled by searchMarket() and returned as a flat product list.
+ */
+async function marketSearch(
+	query: string,
+	limit: number,
+): Promise<{ products: ProductResult[]; records: ProductRecord[] }> {
+	const products = await searchMarket(query, { pageSize: Math.max(limit, 20) });
+	const records: ProductRecord[] = products.map((p) => ({
+		productId: p.productId,
+		name: p.name,
+		price: p.price,
+		merchantId: p.merchantId,
+		merchantName: "Snoonu Market",
+		// Marketplace products resolve via /v7/products with an empty branch_id.
+		branchId: "",
+		imageUrl: p.imageUrl ?? undefined,
+		description: p.description ?? undefined,
+		isInStock: p.isInStock,
+		isAvailable: p.isAvailable,
+		stockCount: p.stockCount,
+		originalPrice: p.originalPrice ?? undefined,
+		discountPercentage: p.discountPercentage ?? undefined,
+	}));
+	await putProducts(records);
+	return { products, records };
+}
 
 // ---------------------------------------------------------------------------
 // Persistence helpers
@@ -48,7 +84,7 @@ const CATEGORIES = [
 function toRecord(
 	p: ProductResult,
 	merchantName: string,
-	menuId?: number,
+	branchId?: string,
 ): ProductRecord {
 	return {
 		productId: p.productId,
@@ -56,7 +92,7 @@ function toRecord(
 		price: p.price,
 		merchantId: p.merchantId,
 		merchantName,
-		menuId,
+		branchId,
 		imageUrl: p.imageUrl ?? undefined,
 		description: p.description ?? undefined,
 		isInStock: p.isInStock,
@@ -71,7 +107,7 @@ function toRecord(
 async function cacheMerchants(merchants: MerchantResult[]): Promise<void> {
 	const records: ProductRecord[] = [];
 	for (const m of merchants) {
-		for (const p of m.products) records.push(toRecord(p, m.name, m.menuId));
+		for (const p of m.products) records.push(toRecord(p, m.name, m.branchId));
 	}
 	await putProducts(records);
 }
@@ -115,7 +151,7 @@ const productOptionSchema = z.object({
 	price: z.number(),
 	merchant: z.string().optional(),
 	merchant_id: z.number().optional(),
-	menu_id: z.number().optional(),
+	branch_id: z.string().optional(),
 	eta: z.number().optional(),
 	free_delivery: z.boolean().optional(),
 	discount: z.number().optional(),
@@ -146,7 +182,7 @@ const bulkSearchOutput = z.object({
 
 const searchInMerchantOutput = z.object({
 	query: z.string(),
-	merchant_id: z.number(),
+	branch_id: z.string(),
 	products: z.array(
 		z.object({
 			id: z.string(),
@@ -164,7 +200,7 @@ const productDetailsOutput = z.object({
 	price: z.number(),
 	merchant: z.string().optional(),
 	merchant_id: z.number().optional(),
-	menu_id: z.number().optional(),
+	branch_id: z.string().optional(),
 	in_stock: z.boolean().optional(),
 	original_price: z.number().optional(),
 	discount: z.number().optional(),
@@ -193,7 +229,7 @@ Use response_format to control token cost:
 
 Set deep_search=true to fan out into each merchant's full catalog via search_in_merchant. This is slower (one extra API call per merchant) but finds products that the global search may miss.
 
-Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) to see a specific merchant's full results, or get_product_details(product_id) for images, stock count, and descriptions.`,
+Next steps after searching: use search_in_merchant(branch_id, query) to see a specific merchant's full results, or get_product_details(product_id) for images, stock count, and descriptions.`,
 			inputSchema: z.object({
 				query: z
 					.string()
@@ -202,7 +238,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 				category: z
 					.enum(CATEGORIES)
 					.optional()
-					.describe("Product category (default: Groceries)"),
+					.describe("Product category to filter by. Omit to search all categories."),
 				limit: z
 					.number()
 					.int()
@@ -230,16 +266,49 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 			},
 		},
 		async ({ query, category, limit, deep_search, response_format }) => {
-			const cat = (category as CategoryName) || "Groceries";
 			const lim = limit || 5;
 			const format = response_format || "concise";
+
+			// Market is a separate vertical with no merchant layer.
+			if (category === "Market") {
+				const { products } = await marketSearch(query, lim);
+				if (products.length === 0) {
+					return ok({
+						query,
+						merchants: 0,
+						cheapest: [],
+						hint: `No Snoonu Market results for "${query}". Try broader terms, or omit the category to search all verticals.`,
+					});
+				}
+				const cheapest = [...products]
+					.sort((a, b) => a.price - b.price)
+					.slice(0, lim * 3)
+					.map((p) => ({
+						id: p.productId,
+						name: p.name,
+						price: p.price,
+						merchant: "Snoonu Market",
+						merchant_id: p.merchantId,
+						...(p.discountPercentage ? { discount: p.discountPercentage } : {}),
+					}));
+				return ok({
+					query,
+					merchants: new Set(products.map((p) => p.merchantId)).size,
+					cheapest,
+					hint: "Snoonu Market results. Use get_product_details(product_id) for images and stock.",
+				});
+			}
+
+			const cat = category as CategoryName | undefined;
 
 			const result = await searchProducts(query, {
 				category: cat,
 				productSize: lim,
 			});
 
-			let openMerchants = result.merchants.filter((m) => m.isOpen);
+			let openMerchants = result.merchants.filter(
+				(m) => m.isOpen || m.acceptsScheduledOrders,
+			);
 
 			if (openMerchants.length === 0) {
 				return ok({
@@ -255,8 +324,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 				openMerchants = await chunkParallel(openMerchants, 5, async (merchant) => {
 					try {
 						const deepProducts = await searchInMerchant(
-							merchant.id,
-							merchant.menuId,
+							merchant.branchId,
 							query,
 						);
 						return {
@@ -281,7 +349,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 				return {
 					name: m.name,
 					id: m.id,
-					menu_id: m.menuId,
+					branch_id: m.branchId,
 					eta: m.minEta,
 					rating: m.rating,
 					free_delivery: m.isFreeDeliveryEligible,
@@ -305,7 +373,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 						price: p.price,
 						merchant: m.name,
 						merchant_id: m.id,
-						menu_id: m.menuId,
+						branch_id: m.branchId,
 						...(p.discountPercentage ? { discount: p.discountPercentage } : {}),
 					})),
 				)
@@ -323,7 +391,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 					merchants: merchantSummaries.length,
 					cheapest,
 					merchant_summaries: merchantSummaries,
-					hint: "Use search_in_merchant(merchant_id, menu_id, query) for full product lists. Use get_product_details(product_id) for images/stock.",
+					hint: "Use search_in_merchant(branch_id, query) for full product lists. Use get_product_details(product_id) for images/stock.",
 				});
 			}
 
@@ -335,7 +403,7 @@ Next steps after searching: use search_in_merchant(merchant_id, menu_id, query) 
 				return {
 					name: m.name,
 					id: m.id,
-					menu_id: m.menuId,
+					branch_id: m.branchId,
 					eta: m.minEta,
 					rating: m.rating,
 					free_delivery: m.isFreeDeliveryEligible,
@@ -373,7 +441,7 @@ Does not require login. Returns up to top_k results per query (default 5). Use g
 				category: z
 					.enum(CATEGORIES)
 					.optional()
-					.describe("Product category for all queries (default: Groceries)"),
+					.describe("Product category for all queries. Omit to search all categories."),
 				merchant_ids: z
 					.array(z.number())
 					.optional()
@@ -403,19 +471,41 @@ Does not require login. Returns up to top_k results per query (default 5). Use g
 			},
 		},
 		async ({ queries, category, deep_search, top_k, merchant_ids }) => {
-			const cat = (category as CategoryName) || "Groceries";
+			const cat = category as CategoryName | undefined;
 			const topK = top_k || 5;
 			const merchantFilter = merchant_ids ? new Set(merchant_ids) : null;
+			const isMarket = category === "Market";
 
 			const queryResults = await chunkParallel(queries, 5, async (query) => {
 				try {
+					// Market is a separate vertical with no merchant layer.
+					if (isMarket) {
+						const { products } = await marketSearch(query, topK);
+						const options = [...products]
+							.sort((a, b) => a.price - b.price)
+							.slice(0, topK)
+							.map((p) => ({
+								id: p.productId,
+								name: p.name,
+								price: p.price,
+								merchant: "Snoonu Market",
+								merchant_id: p.merchantId,
+								...(p.discountPercentage
+									? { discount: p.discountPercentage }
+									: {}),
+							}));
+						return { query, found: options.length, options };
+					}
+
 					const result = await searchProducts(query, {
 						category: cat,
 						productSize: topK,
 					});
 
 					let openMerchants = result.merchants.filter(
-						(m) => m.isOpen && (!merchantFilter || merchantFilter.has(m.id)),
+						(m) =>
+							(m.isOpen || m.acceptsScheduledOrders) &&
+							(!merchantFilter || merchantFilter.has(m.id)),
 					);
 
 					if (deep_search && openMerchants.length > 0) {
@@ -425,8 +515,7 @@ Does not require login. Returns up to top_k results per query (default 5). Use g
 							async (merchant) => {
 								try {
 									const deepProducts = await searchInMerchant(
-										merchant.id,
-										merchant.menuId,
+										merchant.branchId,
 										query,
 									);
 									return {
@@ -455,7 +544,7 @@ Does not require login. Returns up to top_k results per query (default 5). Use g
 								price: p.price,
 								merchant: m.name,
 								merchant_id: m.id,
-								menu_id: m.menuId,
+								branch_id: m.branchId,
 								eta: m.minEta,
 								free_delivery: m.isFreeDeliveryEligible,
 								...(p.discountPercentage
@@ -498,16 +587,15 @@ Does not require login. Returns up to top_k results per query (default 5). Use g
 		"search_in_merchant",
 		{
 			title: "Search Within Merchant",
-			description: `Search within a single merchant's full catalog. Use the merchant_id and menu_id values from a previous search_products or bulk_search result.
+			description: `Search within a single merchant's full catalog. Use the branch_id value from a previous search_products or bulk_search result.
 
 Returns a compact list of matching products (id, name, price, discount) from that merchant only. This is more thorough than the global search for a specific store — it queries the merchant's own search index and often returns products that search_products missed.
 
 Does not require login. Use get_product_details(product_id) on any result for images, descriptions, and stock info.`,
 			inputSchema: z.object({
-				merchant_id: z
-					.number()
-					.describe("Merchant ID from search_products results"),
-				menu_id: z.number().describe("Menu ID from search_products results"),
+				branch_id: z
+					.string()
+					.describe("Branch ID from search_products results"),
 				query: z.string().min(1).describe("Search term within this merchant"),
 			}),
 			outputSchema: searchInMerchantOutput,
@@ -516,8 +604,8 @@ Does not require login. Use get_product_details(product_id) on any result for im
 				openWorldHint: true,
 			},
 		},
-		async ({ merchant_id, menu_id, query }) => {
-			const products = await searchInMerchant(merchant_id, menu_id, query);
+		async ({ branch_id, query }) => {
+			const products = await searchInMerchant(branch_id, query);
 
 			// Persist. Prefer a merchant name we already know over the placeholder.
 			const records = await Promise.all(
@@ -525,8 +613,8 @@ Does not require login. Use get_product_details(product_id) on any result for im
 					const known = await getProduct(p.productId);
 					return toRecord(
 						p,
-						known?.merchantName ?? `merchant_${merchant_id}`,
-						menu_id,
+						known?.merchantName ?? `branch_${branch_id}`,
+						branch_id,
 					);
 				}),
 			);
@@ -535,7 +623,7 @@ Does not require login. Use get_product_details(product_id) on any result for im
 			if (products.length === 0) {
 				return ok({
 					query,
-					merchant_id,
+					branch_id,
 					products: [],
 					hint: `No results for "${query}" in this merchant. Try broader terms or search_products for other merchants.`,
 				});
@@ -543,7 +631,7 @@ Does not require login. Use get_product_details(product_id) on any result for im
 
 			return ok({
 				query,
-				merchant_id,
+				branch_id,
 				products: products.map(compactProduct),
 				hint: "Use get_product_details(id) for images, descriptions, and stock info.",
 			});
@@ -557,18 +645,35 @@ Does not require login. Use get_product_details(product_id) on any result for im
 			title: "Get Product Details",
 			description: `Get full details for a single product by its product_id. Returns image URL, description, stock count, original price, discount percentage, and availability — fields that are omitted from search results to save tokens.
 
-The product must have been seen in a previous search (results are remembered on disk across restarts). If it is unknown, search for it first with search_products or search_in_merchant.`,
+The product is first looked up in the persistent store (populated by previous searches). If it is not found and a branch_id is provided, it is fetched live from the API. If neither source has the product, search for it first with search_products or search_in_merchant.`,
 			inputSchema: z.object({
 				product_id: z.string().min(1).describe("Product ID from search results"),
+				branch_id: z
+					.string()
+					.optional()
+					.describe(
+						"Branch ID of the merchant. Required to fetch products not in the local store.",
+					),
 			}),
 			outputSchema: productDetailsOutput,
 			annotations: {
 				readOnlyHint: true,
-				openWorldHint: false,
+				openWorldHint: true,
 			},
 		},
-		async ({ product_id }) => {
-			const cached = await getProduct(product_id);
+		async ({ product_id, branch_id }) => {
+			let cached = await getProduct(product_id);
+
+			if (!cached && branch_id) {
+				try {
+					const live = await fetchProductById(product_id, branch_id);
+					const record = toRecord(live, `branch_${branch_id}`, branch_id);
+					await putProducts([record]);
+					cached = record;
+				} catch {
+					// Fall through to the "not known" error below.
+				}
+			}
 
 			if (!cached) {
 				return fail(
@@ -586,7 +691,7 @@ The product must have been seen in a previous search (results are remembered on 
 				in_stock: cached.isInStock,
 			};
 
-			if (cached.menuId !== undefined) detail.menu_id = cached.menuId;
+			if (cached.branchId !== undefined) detail.branch_id = cached.branchId;
 			if (cached.originalPrice) detail.original_price = cached.originalPrice;
 			if (cached.discountPercentage) detail.discount = cached.discountPercentage;
 			if (cached.imageUrl) detail.image_url = cached.imageUrl;

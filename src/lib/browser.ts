@@ -94,6 +94,14 @@ export async function navigateToSnoonu(): Promise<void> {
 
 	if (!p.url().includes("snoonu.com")) {
 		await p.goto("https://snoonu.com", { waitUntil: "domcontentloaded" });
+		// domcontentloaded fires before this Next.js app hydrates; interactive
+		// elements (loginBtn, the header) are not wired up yet. Wait for the
+		// header to actually exist rather than racing it.
+		await p
+			.locator('[data-test-id="loginBtn"], [data-test-id="locationBtnOnHeader"]')
+			.first()
+			.waitFor({ state: "visible", timeout: 30000 })
+			.catch(() => {});
 	}
 
 	// Dismiss location modal if present
@@ -109,33 +117,77 @@ export async function requestOtp(phoneNumber: string): Promise<{ success: boolea
 		const p = await connectBrowser();
 		await navigateToSnoonu();
 
-		// Click login button - try data-test-id first, fall back to text
-		try {
-			await p.locator('[data-test-id="loginBtn"]').click({ timeout: 3000 });
-		} catch {
-			// Fall back to finding button by text
-			await p.locator('button:has-text("Login")').first().click({ timeout: 3000 });
-		}
-		await p.waitForTimeout(500);
-
-		// Dismiss location modal if it appeared
+		// Dismiss the location modal BEFORE clicking login. It renders on top of
+		// the header and swallows the click, which left the login modal closed
+		// and the phone field never present.
 		await dismissLocationModal(p);
 
-		// Enter phone number
-		const phoneInput = p.locator('input[type="tel"]').first();
-		await phoneInput.waitFor({ state: "visible", timeout: 5000 });
-		await phoneInput.click();
+		// Click login button - try data-test-id first, fall back to text
+		try {
+			await p.locator('[data-test-id="loginBtn"]').click({ timeout: 5000 });
+		} catch {
+			// Fall back to finding button by text
+			await p.locator('button:has-text("Login")').first().click({ timeout: 5000 });
+		}
+		// Enter phone number. Prefer the stable test id — `input[type="tel"]`
+		// also matches the OTP field, so ordering was fragile.
+		//
+		// Do NOT call dismissLocationModal() here. confirmLocationBtn /
+		// crossIconBtn live in the same modal component tree as the login form
+		// and only enter the DOM once the login modal opens; clicking one at
+		// this point swaps the login modal for the address picker and the phone
+		// field never appears.
+		const phoneInput = p
+			.locator('[data-test-id="phoneInputField"], input[type="tel"]')
+			.first();
+		try {
+			await phoneInput.waitFor({ state: "visible", timeout: 15000 });
+		} catch {
+			// Login modal never opened — a blocking overlay is the usual cause.
+			// Dismiss it and click login once more before giving up.
+			await dismissLocationModal(p);
+			await p
+				.locator('[data-test-id="loginBtn"]')
+				.click({ timeout: 5000 })
+				.catch(() => {});
+			await phoneInput.waitFor({ state: "visible", timeout: 15000 });
+		}
+		// The login modal renders an address/map picker whose loading skeleton
+		// (MapLoading-module…__loading) sits above the form and swallows pointer
+		// events, so .click() retries until it times out. Wait for the skeleton
+		// to go away, then fill() — fill focuses via the DOM and does not
+		// hit-test, so it works even if something is still overlaying.
+		await p
+			.locator('[class*="MapLoading"][class*="loading"], [class*="Skeleton"]')
+			.first()
+			.waitFor({ state: "detached", timeout: 15000 })
+			.catch(() => {});
 		await phoneInput.fill(phoneNumber);
 
-		// Click continue button
+		// Click continue. The same overlay that blocks the phone field can block
+		// this, so fall back to a forced click and then a DOM-level click.
+		const continueBtn = p
+			.locator('[data-test-id="btnContinueLogin"], button:has-text("Continue")')
+			.first();
 		try {
-			await p.locator('[data-test-id="btnContinueLogin"]').click({ timeout: 3000 });
+			await continueBtn.click({ timeout: 5000 });
 		} catch {
-			await p.locator('button:has-text("Continue")').first().click({ timeout: 3000 });
+			try {
+				await continueBtn.click({ timeout: 5000, force: true });
+			} catch {
+				await continueBtn.evaluate((el) => (el as HTMLElement).click());
+			}
 		}
 
-		// Wait for OTP input to appear
-		await p.locator('input[type="tel"]').first().waitFor({ state: "visible", timeout: 30000 });
+		// Wait for the OTP screen specifically. This used to wait for
+		// `input[type="tel"]`, which the PHONE field already satisfies — so it
+		// reported "OTP sent" even when the request never went through.
+		// Verified against the live DOM: the OTP field is
+		// data-test-id="pinInputField" (name="pin", autocomplete="one-time-code").
+		await p
+			.locator('[data-test-id="pinInputField"], input[name="pin"]')
+			.first()
+			.waitFor({ state: "visible", timeout: 30000 });
 
 		return { success: true, message: "OTP sent. Enter the 6-digit code." };
 	} catch (error) {
@@ -158,13 +210,19 @@ export async function verifyOtp(otpCode: string): Promise<{
 	try {
 		const p = await connectBrowser();
 
-		// Find OTP input and fill it
-		const otpInput = p.locator('input[type="tel"]').first();
-		await otpInput.waitFor({ state: "visible", timeout: 5000 });
-		await otpInput.fill(otpCode);
+		// Target the OTP field explicitly. `input[type="tel"]).first()` was
+		// ambiguous — on some screens it resolves to the phone field instead.
+		const otpInput = p
+			.locator('[data-test-id="pinInputField"], input[name="pin"], input[type="tel"]')
+			.first();
+		await otpInput.waitFor({ state: "visible", timeout: 10000 });
+		await otpInput.fill("");
+		// Type rather than fill: the field is a controlled React input that only
+		// submits once it sees per-character input events.
+		await otpInput.type(otpCode, { delay: 120 });
 
 		// Wait for login to complete (login button disappears or modal closes)
-		await p.waitForTimeout(3000);
+		await p.waitForTimeout(6000);
 
 		// Extract session from browser
 		const session = await extractSessionFromBrowser(p);
@@ -303,25 +361,39 @@ export async function goToCheckout(): Promise<{
 /**
  * Dismiss the location confirmation modal if present.
  */
-async function dismissLocationModal(p: Page): Promise<void> {
-	try {
-		// Try to find and click "Confirm location" button
-		const confirmBtn = p.locator('button:has-text("Confirm location")');
-		if (await confirmBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-			await confirmBtn.click();
-			await p.waitForTimeout(500);
-			return;
-		}
+async function dismissLocationModal(p: Page): Promise<boolean> {
+	// Snoonu is location-gated: until this modal is resolved, the delivery
+	// location is unset and catalogue/search requests come back empty. The old
+	// selectors ('button:has-text("Confirm location")' and
+	// '[class*="Modal_cross"], [aria-label="Close"]') no longer exist in the
+	// live DOM, so the modal was never dismissed and searches silently
+	// returned nothing. Verified against snoonu.com — the real hooks are
+	// data-test-id="confirmLocationBtn" / "crossIconBtn" / "crossXBtn".
+	const confirmSelectors = [
+		'[data-test-id="confirmLocationBtn"]',
+		'button:has-text("Confirm location")',
+		'button:has-text("Confirm")',
+	];
+	const closeSelectors = [
+		'[data-test-id="crossIconBtn"]',
+		'[data-test-id="crossXBtn"]',
+		'[class*="Modal_cross"]',
+		'[aria-label="Close"]',
+	];
 
-		// Try close button with various selectors
-		const closeBtn = p.locator('[class*="Modal_cross"], [aria-label="Close"]').first();
-		if (await closeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-			await closeBtn.click();
-			await p.waitForTimeout(500);
+	for (const sel of [...confirmSelectors, ...closeSelectors]) {
+		try {
+			const el = p.locator(sel).first();
+			if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+				await el.click({ timeout: 3000 });
+				await p.waitForTimeout(600);
+				return true;
+			}
+		} catch {
+			// try the next selector
 		}
-	} catch {
-		// Modal not present
 	}
+	return false;
 }
 
 /**
@@ -595,13 +667,19 @@ export async function clickPlaceOrder(): Promise<{
 		return { success: true, message: "Order placed successfully!", url: finalUrl };
 	}
 
-	if (finalUrl !== "https://snoonu.com/checkout") {
+	// Previously this compared against the literal "https://snoonu.com/checkout".
+	// Any locale prefix or query string (e.g. /en/checkout, /checkout?step=2)
+	// made that comparison false, so a checkout page that never navigated was
+	// reported as a successful order. Check whether we are still on ANY
+	// checkout URL instead.
+	if (!finalUrl.includes("/checkout")) {
 		return { success: true, message: "Order submitted.", url: finalUrl };
 	}
 
 	return {
 		success: false,
-		message: "Order may not have been placed. The page did not navigate away from checkout.",
+		message:
+			"Order was not placed — the page stayed on checkout. Check that a payment method is selected and the address is complete.",
 		url: finalUrl,
 	};
 }
