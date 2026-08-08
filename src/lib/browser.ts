@@ -129,29 +129,50 @@ export async function requestOtp(phoneNumber: string): Promise<{ success: boolea
 			// Fall back to finding button by text
 			await p.locator('button:has-text("Login")').first().click({ timeout: 5000 });
 		}
-		// Enter phone number. Prefer the stable test id — `input[type="tel"]`
-		// also matches the OTP field, so ordering was fragile.
+		// Opening login pops the "Set your location" modal ON TOP of the login
+		// form. The phone field and Continue button are then visible to
+		// Playwright but not clickable — every click is silently intercepted,
+		// so the form never submits, no OTP request is sent, and the PIN screen
+		// never appears, with no error shown anywhere.
 		//
-		// Do NOT call dismissLocationModal() here. confirmLocationBtn /
-		// crossIconBtn live in the same modal component tree as the login form
-		// and only enter the DOM once the login modal opens; clicking one at
-		// this point swaps the login modal for the address picker and the phone
-		// field never appears.
+		// Confirming the location dismisses that overlay AND closes the login
+		// modal with it, so login has to be reopened afterwards. The upside is
+		// that the delivery location is now set, which the location-gated
+		// search needs regardless.
 		const phoneInput = p
 			.locator('[data-test-id="phoneInputField"], input[type="tel"]')
 			.first();
-		try {
-			await phoneInput.waitFor({ state: "visible", timeout: 15000 });
-		} catch {
-			// Login modal never opened — a blocking overlay is the usual cause.
-			// Dismiss it and click login once more before giving up.
+
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const blocked = await p
+				.locator('[data-test-id="confirmLocationBtn"]')
+				.first()
+				.isVisible({ timeout: 1500 })
+				.catch(() => false);
+
+			if (!blocked) {
+				const ready = await phoneInput
+					.isVisible({ timeout: 4000 })
+					.catch(() => false);
+				if (ready) break;
+			}
+
 			await dismissLocationModal(p);
 			await p
-				.locator('[data-test-id="loginBtn"]')
-				.click({ timeout: 5000 })
+				.locator('[data-test-id="confirmLocationBtn"]')
+				.first()
+				.waitFor({ state: "detached", timeout: 8000 })
 				.catch(() => {});
-			await phoneInput.waitFor({ state: "visible", timeout: 15000 });
+
+			// Reopen login — confirming the location closed it too.
+			await p
+				.locator('[data-test-id="loginBtn"]')
+				.click({ timeout: 8000 })
+				.catch(() => {});
+			await p.waitForTimeout(2000);
 		}
+
+		await phoneInput.waitFor({ state: "visible", timeout: 20000 });
 		// The login modal renders an address/map picker whose loading skeleton
 		// (MapLoading-module…__loading) sits above the form and swallows pointer
 		// events, so .click() retries until it times out. Wait for the skeleton
@@ -162,7 +183,22 @@ export async function requestOtp(phoneNumber: string): Promise<{ success: boolea
 			.first()
 			.waitFor({ state: "detached", timeout: 15000 })
 			.catch(() => {});
-		await phoneInput.fill(phoneNumber);
+
+		// The phone field is a controlled React input. fill() sets the DOM value
+		// but the component's state never updates, so Continue submits an empty
+		// form: no validation error, no OTP request, and the PIN screen never
+		// appears. focus() + per-character input makes React see it.
+		await phoneInput.focus();
+		await phoneInput.fill("");
+		await phoneInput.pressSequentially(phoneNumber, { delay: 90 });
+
+		const entered = await phoneInput.inputValue().catch(() => "");
+		if (entered.replace(/\D/g, "") !== phoneNumber.replace(/\D/g, "")) {
+			return {
+				success: false,
+				message: `Phone number did not register in the form (field shows "${entered}"). The login modal may have re-rendered mid-entry — retry.`,
+			};
+		}
 
 		// Click continue. The same overlay that blocks the phone field can block
 		// this, so fall back to a forced click and then a DOM-level click.
@@ -539,6 +575,68 @@ export async function syncLocationToBrowser(
 }
 
 /**
+ * Fill the required delivery-detail fields on the checkout page.
+ *
+ * This is why place_order failed. The payment radios were never the problem —
+ * `input[name="paymentMethod"]` is correct and returns 4 options (saved card,
+ * google_pay, debit_card, cash) once the cart is non-empty. What actually keeps
+ * `placeOrderBtn` disabled is that `addressName`, `buildingNumber` and
+ * `numberOnDoor` are required and empty, and nothing could populate them.
+ */
+export async function fillDeliveryDetails(details: {
+	name?: string;
+	buildingNumber?: string;
+	numberOnDoor?: string;
+	driverNote?: string;
+}): Promise<{ success: boolean; filled: string[]; message: string }> {
+	const p = await connectBrowser();
+
+	if (!p.url().includes("/checkout")) {
+		return {
+			success: false,
+			filled: [],
+			message: "Not on checkout page. Call go_to_checkout first.",
+		};
+	}
+
+	const fields: Array<[keyof typeof details, string]> = [
+		["name", '[data-test-id="name"]'],
+		["buildingNumber", '[data-test-id="buildingNumberField"]'],
+		["numberOnDoor", '[data-test-id="numberOnDoorField"]'],
+		["driverNote", '[data-test-id="driverNote"]'],
+	];
+
+	const filled: string[] = [];
+	for (const [key, selector] of fields) {
+		const value = details[key];
+		if (!value) continue;
+		const el = p.locator(selector).first();
+		if (!(await el.isVisible({ timeout: 3000 }).catch(() => false))) continue;
+		// Controlled React inputs: type per character so component state updates.
+		await el.focus();
+		await el.fill("");
+		await el.pressSequentially(value, { delay: 40 });
+		filled.push(key);
+	}
+
+	await p.waitForTimeout(1200);
+
+	const enabled = await p
+		.locator('[data-test-id="placeOrderBtn"]')
+		.first()
+		.isEnabled()
+		.catch(() => false);
+
+	return {
+		success: true,
+		filled,
+		message: enabled
+			? "Delivery details saved. Place order is now enabled."
+			: "Delivery details saved, but Place order is still disabled — a payment method may still need selecting.",
+	};
+}
+
+/**
  * Scrape payment methods from the checkout page.
  * Reads the radiogroup[name="paymentMethod"] inputs.
  */
@@ -572,6 +670,19 @@ export async function getPaymentMethods(): Promise<{
 				};
 			});
 		});
+
+		if (methods.length === 0) {
+			// Reporting "found 0 methods" as a success is how this stayed
+			// invisible: the payment section only renders once the cart has
+			// items, so an empty cart looked like a working call returning
+			// nothing.
+			return {
+				success: false,
+				methods: [],
+				message:
+					"No payment methods on the page. The payment section only renders when the cart has items — check get_cart, and make sure go_to_checkout actually loaded the checkout page.",
+			};
+		}
 
 		return { success: true, methods, message: `Found ${methods.length} payment methods.` };
 	} catch (error) {

@@ -97,7 +97,30 @@ if (!alreadyIn) {
 	await hardClick('[data-test-id="loginBtn"]');
 	await settle(3000);
 
+	// The "Set your location" modal opens on top of the login form and
+	// intercepts every click. Confirming it also closes the login modal, so
+	// login must be reopened afterwards.
 	const phone = page.locator('[data-test-id="phoneInputField"]').first();
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const blocked = await page
+			.locator('[data-test-id="confirmLocationBtn"]')
+			.first()
+			.isVisible({ timeout: 1500 })
+			.catch(() => false);
+		if (!blocked && (await phone.isVisible({ timeout: 4000 }).catch(() => false))) {
+			log("phone field reachable");
+			break;
+		}
+		log(`  location overlay in the way (attempt ${attempt + 1}) — clearing + reopening login`);
+		await dismissOverlays();
+		await page
+			.locator('[data-test-id="confirmLocationBtn"]')
+			.first()
+			.waitFor({ state: "detached", timeout: 8000 })
+			.catch(() => {});
+		await hardClick('[data-test-id="loginBtn"]');
+		await settle(2500);
+	}
 	await phone.waitFor({ state: "visible", timeout: 20_000 });
 	// Wait out the map skeleton that overlays the form, then fill (no hit-test).
 	await page
@@ -105,8 +128,19 @@ if (!alreadyIn) {
 		.first()
 		.waitFor({ state: "detached", timeout: 12_000 })
 		.catch(() => {});
-	await phone.fill(PHONE);
-	log("phone filled");
+	// Controlled React input: fill() alone leaves component state empty, so
+	// Continue submits nothing and no OTP is ever requested.
+	await phone.focus();
+	await phone.fill("");
+	await phone.pressSequentially(PHONE, { delay: 90 });
+	const entered = await phone.inputValue();
+	log("phone field now reads:", JSON.stringify(entered));
+	if (entered.replace(/\D/g, "") !== PHONE.replace(/\D/g, "")) {
+		log("!! phone did not register — aborting rather than sending a bad request");
+		await page.screenshot({ path: "/tmp/probe-phone-fail.png" });
+		await browser.close();
+		process.exit(1);
+	}
 
 	await hardClick('[data-test-id="btnContinueLogin"]');
 	log("continue clicked — SMS sending");

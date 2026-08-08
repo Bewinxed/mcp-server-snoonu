@@ -8,7 +8,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { getApiHeaders } from "../../lib/session-manager";
-import { goToCheckout, syncCartViaBrowser, syncCartToLocalStorage, getPaymentMethods, selectPaymentMethod, clickPlaceOrder } from "../../lib/browser";
+import { goToCheckout, syncCartViaBrowser, syncCartToLocalStorage, getPaymentMethods, selectPaymentMethod, clickPlaceOrder, fillDeliveryDetails } from "../../lib/browser";
 import { getCart } from "../../lib/api-client";
 import { ensureAuthenticated } from "../lib/auth";
 import { ok, fail, authRequired } from "../lib/result";
@@ -167,6 +167,60 @@ Requires the checkout page to be open.`,
 			return ok({
 				message: result.message,
 			});
+		},
+	);
+
+	server.registerTool(
+		"set_delivery_details",
+		{
+			title: "Set Delivery Details",
+			description: `Fill the required delivery detail fields on the Snoonu checkout page: address label, building number, and door number, plus an optional note for the driver.
+
+Snoonu keeps the "Place order" button DISABLED until these fields are filled, so if place_order reports the button is disabled, call this first. Requires login and the checkout page to be open (call go_to_checkout first).
+
+Ask the user for their building and door number rather than guessing — a wrong address means a failed delivery.`,
+			inputSchema: z.object({
+				name: z
+					.string()
+					.optional()
+					.describe("Label for the address, e.g. 'Home' or 'Office'"),
+				building_number: z
+					.string()
+					.optional()
+					.describe("Building number, e.g. '12'"),
+				number_on_door: z
+					.string()
+					.optional()
+					.describe("Door/apartment number, e.g. '4B'"),
+				driver_note: z
+					.string()
+					.optional()
+					.describe("Optional note for the delivery driver"),
+			}),
+			outputSchema: z.object({
+				filled: z.array(z.string()),
+				message: z.string(),
+			}),
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: true,
+				openWorldHint: true,
+			},
+		},
+		async ({ name, building_number, number_on_door, driver_note }) => {
+			if (!(await ensureAuthenticated())) return authRequired("set delivery details");
+
+			const result = await fillDeliveryDetails({
+				name,
+				buildingNumber: building_number,
+				numberOnDoor: number_on_door,
+				driverNote: driver_note,
+			});
+
+			if (!result.success) return fail(result.message);
+
+			return ok({ filled: result.filled, message: result.message });
 		},
 	);
 
