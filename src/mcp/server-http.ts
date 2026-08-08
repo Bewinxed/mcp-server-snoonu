@@ -64,21 +64,83 @@ const isLoopbackBind = BIND_HOST === "127.0.0.1" || BIND_HOST === "localhost";
 /**
  * Hostnames accepted in the Host header (DNS-rebinding protection).
  *
- * That protection exists to stop a browser on the SAME machine from reaching a
- * loopback-bound server via a rebound DNS name. A deliberately public
- * deployment has a different threat model — and defaulting to a localhost-only
- * allowlist there means every request to https://your-domain/mcp arrives with
- * Host: your-domain and gets a bare 403 that explains nothing.
+ * What this actually defends against: a malicious page rebinding its own
+ * hostname to 127.0.0.1 so the victim's browser can reach a server it could not
+ * otherwise route to. The rebound request still carries `Host: evil.com`, so a
+ * strict allowlist rejects it. That threat is specific to servers reachable
+ * only from the victim's machine or network.
  *
- * So: loopback bind keeps the strict localhost allowlist. A non-loopback bind
- * is an explicit choice to be reachable, so host checking is skipped unless
- * MCP_ALLOWED_HOSTS pins it down — with a warning, and with bearer auth still
- * mandatory.
+ * For a public deployment on a real domain, it buys very little — an attacker
+ * can already reach the host directly, so the bearer token is what actually
+ * gates access. Which is why an unresolvable host is a warning here, not a
+ * fatal error.
+ *
+ * Rather than making the operator hand-configure it, derive the public
+ * hostname from whatever the platform already exports. MCP_ALLOWED_HOSTS still
+ * overrides everything.
  */
+const PLATFORM_HOST_VARS = [
+	"MCP_PUBLIC_URL",
+	"PUBLIC_URL",
+	"COOLIFY_FQDN", // Coolify
+	"COOLIFY_URL",
+	"SERVICE_FQDN",
+	"RAILWAY_PUBLIC_DOMAIN", // Railway
+	"RENDER_EXTERNAL_URL", // Render
+	"VERCEL_URL", // Vercel
+	"FLY_APP_NAME", // Fly.io (bare app name -> .fly.dev)
+] as const;
+
+/** Pull a bare hostname out of a value that may be a URL, a host, or a list. */
+function toHostnames(raw: string, varName: string): string[] {
+	return raw
+		.split(",")
+		.map((piece) => piece.trim())
+		.filter(Boolean)
+		.map((piece) => {
+			if (varName === "FLY_APP_NAME" && !piece.includes(".")) {
+				return `${piece}.fly.dev`;
+			}
+			try {
+				return new URL(piece.includes("://") ? piece : `https://${piece}`).hostname;
+			} catch {
+				return piece;
+			}
+		})
+		.filter(Boolean);
+}
+
+function detectPlatformHosts(): { hosts: string[]; source: string } | null {
+	for (const varName of PLATFORM_HOST_VARS) {
+		const raw = process.env[varName];
+		if (!raw?.trim()) continue;
+		const hosts = toHostnames(raw, varName);
+		if (hosts.length > 0) return { hosts, source: varName };
+	}
+	return null;
+}
+
 const explicitHosts = process.env.MCP_ALLOWED_HOSTS?.split(",")
 	.map((h) => h.trim())
 	.filter(Boolean);
-const allowedHosts = explicitHosts ?? (isLoopbackBind ? localhostAllowedHostnames() : null);
+
+const detected = explicitHosts ? null : detectPlatformHosts();
+
+const allowedHosts: string[] | null =
+	explicitHosts ??
+	(detected
+		? [...new Set([...detected.hosts, ...localhostAllowedHostnames()])]
+		: isLoopbackBind
+			? localhostAllowedHostnames()
+			: null);
+
+const hostSource = explicitHosts
+	? "MCP_ALLOWED_HOSTS"
+	: detected
+		? `auto-detected from ${detected.source}`
+		: isLoopbackBind
+			? "loopback default"
+			: "disabled";
 
 const explicitOrigins = process.env.MCP_ALLOWED_ORIGINS?.split(",")
 	.map((o) => o.trim())
@@ -229,7 +291,7 @@ console.error(`  Health:  /health`);
 console.error(`  MCP:     /mcp`);
 console.error(`  Auth:    ${AUTH_TOKEN ? "bearer token required" : "ANONYMOUS (insecure)"}`);
 console.error(
-	`  Hosts:   ${allowedHosts ? allowedHosts.join(", ") : "any (not checked — non-loopback bind, MCP_ALLOWED_HOSTS unset)"}`,
+	`  Hosts:   ${allowedHosts ? `${allowedHosts.join(", ")}  [${hostSource}]` : "any (not checked — no public hostname found)"}`,
 );
 console.error(`  Origins: ${allowedOrigins.join(", ")}`);
 console.error(`  Store:   ${process.env.REDIS_URL ? "redis" : "disk"}`);
@@ -242,8 +304,11 @@ if (isLoopbackBind) {
 }
 if (!allowedHosts) {
 	console.error(
-		`\n  WARNING: Host header validation is OFF. Set MCP_ALLOWED_HOSTS=your.domain\n` +
-			`  to re-enable DNS-rebinding protection.`,
+		`\n  NOTE: Host header validation is off — no public hostname could be\n` +
+			`  detected from the environment. It is auto-detected from any of:\n` +
+			`    ${PLATFORM_HOST_VARS.join(", ")}\n` +
+			`  or set MCP_ALLOWED_HOSTS=your.domain explicitly. Bearer auth is the\n` +
+			`  real access gate; this only adds DNS-rebinding protection.`,
 	);
 }
 

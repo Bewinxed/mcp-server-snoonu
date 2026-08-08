@@ -102,21 +102,43 @@ refuses to start unencrypted-and-open:
 | `ALLOW_ANONYMOUS=1` | Explicit opt-out of the above. Only for a genuinely private port |
 | `HOST` | Bind address. **Must be `0.0.0.0` for containers/remote** (default `127.0.0.1`) |
 | `PORT` | Port (default `3000`) |
-| `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host`. See below |
+| `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host`. **Usually unnecessary** — auto-detected, see below |
 | `MCP_ALLOWED_ORIGINS` | Comma-separated origin hostnames for CORS (default: localhost only) |
 | `REDIS_URL` | Share cart/product state across replicas |
-
-Origin is always validated. Host validation (DNS-rebinding protection) applies
-when bound to loopback; on a non-loopback bind it is skipped unless
-`MCP_ALLOWED_HOSTS` is set, because a localhost-only allowlist would reject
-every request to your real domain. Set it in production:
 
 ```bash
 docker run -p 3000:3000 \
   -e HOST=0.0.0.0 \
   -e MCP_AUTH_TOKEN=$(openssl rand -hex 32) \
-  -e MCP_ALLOWED_HOSTS=mcp.example.com \
   mcp-server-snoonu
+```
+
+#### Host validation, and why you probably don't need to configure it
+
+`Host` checking exists for one narrow attack: DNS rebinding, where a malicious
+page repoints its own hostname at `127.0.0.1` so the victim's browser can reach
+a server it couldn't otherwise route to. The rebound request still carries
+`Host: evil.com`, so an allowlist rejects it.
+
+That threat is specific to servers reachable only from the victim's machine.
+On a public domain it buys little — an attacker can hit the host directly, so
+**the bearer token is what actually gates access**.
+
+So the allowlist is derived automatically, in this order:
+
+1. `MCP_ALLOWED_HOSTS`, if set — always wins
+2. The platform's own hostname variable, whichever exists:
+   `MCP_PUBLIC_URL`, `PUBLIC_URL`, `COOLIFY_FQDN`, `COOLIFY_URL`, `SERVICE_FQDN`,
+   `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_URL`, `VERCEL_URL`, `FLY_APP_NAME`
+3. Loopback bind → localhost only
+4. Otherwise → validation off, with a startup note
+
+Values may be full URLs or bare hostnames; `localhost` is always kept alongside
+so health checks keep working. The startup banner prints the result and where it
+came from, e.g.
+
+```
+Hosts:   snoonu.example.com, localhost, 127.0.0.1, [::1]  [auto-detected from COOLIFY_FQDN]
 ```
 
 The startup banner prints the effective auth, host, origin and store settings —
