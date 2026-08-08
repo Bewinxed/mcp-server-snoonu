@@ -21,7 +21,12 @@ ENV HOST=0.0.0.0
 #   docker run -e MCP_AUTH_TOKEN=... -e MCP_ALLOWED_HOSTS=your.host ...
 # Set REDIS_URL to share cart/product state across replicas.
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD bun -e "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+# Health check. Uses the PORT env var rather than a hardcoded 3000, and prefers
+# wget/curl when present because some platforms (Coolify) expect one of those;
+# falls back to bun, which is always in this image.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD sh -c 'wget -qO- "http://127.0.0.1:${PORT:-3000}/health" >/dev/null 2>&1 \
+    || curl -fsS "http://127.0.0.1:${PORT:-3000}/health" >/dev/null 2>&1 \
+    || bun -e "fetch(\"http://127.0.0.1:\"+(process.env.PORT||3000)+\"/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"'
 
 CMD ["bun", "run", "src/mcp/server-http.ts"]

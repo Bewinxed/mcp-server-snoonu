@@ -100,17 +100,37 @@ refuses to start unencrypted-and-open:
 | -------- | ------- |
 | `MCP_AUTH_TOKEN` | **Required.** Clients must send `Authorization: Bearer <token>` |
 | `ALLOW_ANONYMOUS=1` | Explicit opt-out of the above. Only for a genuinely private port |
-| `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host` (default: localhost only) |
+| `HOST` | Bind address. **Must be `0.0.0.0` for containers/remote** (default `127.0.0.1`) |
+| `PORT` | Port (default `3000`) |
+| `MCP_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host`. See below |
 | `MCP_ALLOWED_ORIGINS` | Comma-separated origin hostnames for CORS (default: localhost only) |
-| `HOST` / `PORT` | Bind address (default `127.0.0.1`) and port (default `3000`) |
 | `REDIS_URL` | Share cart/product state across replicas |
 
-Host and Origin headers are validated on every request (DNS-rebinding
-protection, as the spec requires).
+Origin is always validated. Host validation (DNS-rebinding protection) applies
+when bound to loopback; on a non-loopback bind it is skipped unless
+`MCP_ALLOWED_HOSTS` is set, because a localhost-only allowlist would reject
+every request to your real domain. Set it in production:
 
 ```bash
-docker run -p 3000:3000 -e MCP_AUTH_TOKEN=$(openssl rand -hex 32) mcp-server-snoonu
+docker run -p 3000:3000 \
+  -e HOST=0.0.0.0 \
+  -e MCP_AUTH_TOKEN=$(openssl rand -hex 32) \
+  -e MCP_ALLOWED_HOSTS=mcp.example.com \
+  mcp-server-snoonu
 ```
+
+The startup banner prints the effective auth, host, origin and store settings —
+check it first when a deployment misbehaves.
+
+### Troubleshooting
+
+| Symptom | Cause |
+| ------- | ----- |
+| `{"error":{"code":-32000,"message":"Bad Request: No valid session"}}` | You are running a **pre-0.3.0 build**. That code path no longer exists — redeploy. |
+| Container exits immediately | `MCP_AUTH_TOKEN` is unset. Set it, or `ALLOW_ANONYMOUS=1`. |
+| Connection refused from outside | `HOST` is still `127.0.0.1`. Set `HOST=0.0.0.0`. |
+| `403` mentioning `MCP_ALLOWED_HOSTS` | Add your domain to `MCP_ALLOWED_HOSTS`. |
+| `401` | Missing or wrong `Authorization: Bearer <token>`. |
 
 ## Architecture
 
