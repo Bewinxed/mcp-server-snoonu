@@ -260,6 +260,62 @@ export async function fetchProductById(
 	};
 }
 
+// ---------- Account identity ----------
+
+export interface SnoonuIdentity {
+	id: number;
+	phone: string;
+	name?: string;
+}
+
+/**
+ * Resolve who a token belongs to, and thereby validate it.
+ *
+ * Snoonu returns HTTP 200 for an invalid or empty token on most endpoints
+ * (verified: /v6/address answers 200 with a bad token), so status codes are
+ * useless for validation. `customer_data` is the exception that is actually
+ * usable: with a good token it returns an object carrying `id` and `phone`;
+ * with a bad or empty one it returns 200 and an EMPTY body. Presence of `id`
+ * is therefore the signal.
+ *
+ * Takes credentials explicitly rather than reading the ambient session, because
+ * it is used to check a token BEFORE any session exists for that user.
+ */
+export async function fetchIdentity(
+	authToken: string,
+	deviceId: string,
+): Promise<SnoonuIdentity | null> {
+	const res = await fetch(`${SNOONU_API_BASE}/v3/customer_data`, {
+		method: "POST",
+		headers: {
+			accept: "*/*",
+			"content-type": "application/json",
+			appversion: "2",
+			language: "en",
+			latitude: "25.285564",
+			longitude: "51.531445",
+			"snoonu-app-device-id": deviceId,
+			"snoonu-app-platform": "Web",
+			"snoonu-app-version": "65535.65535.65535.65535",
+			token: authToken,
+		},
+		body: "{}",
+	});
+
+	const text = await res.text();
+	if (!text.trim()) return null; // empty body == rejected credential
+
+	try {
+		const data = JSON.parse(text);
+		if (!data?.id || !data?.phone) return null;
+		// Deliberately NOT returning email/pin — customer_data also echoes the
+		// account PIN, which this server has no business holding onto.
+		return { id: data.id, phone: String(data.phone), name: data.name };
+	} catch {
+		return null;
+	}
+}
+
 // ---------- Snoomarket (the "Market" vertical) ----------
 
 /**

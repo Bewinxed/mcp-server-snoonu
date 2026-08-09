@@ -31,6 +31,8 @@ import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypt
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
 import { runAsUser } from "./user-context";
 import { requestOtp, verifyOtp } from "../../lib/browser";
+import { fetchIdentity } from "../../lib/api-client";
+import { saveSession } from "../../lib/session-manager";
 
 /**
  * The SDK maps OAuthError -> 401/403 with the WWW-Authenticate challenge.
@@ -415,7 +417,7 @@ export async function handleOAuth(
 				)
 				.join("");
 
-		// Step 1 — ask for the phone number.
+		// Step 1 — offer both sign-in methods.
 		if (req.method === "GET") {
 			return html(`
 				<h1>Sign in to Snoonu</h1>
@@ -424,16 +426,100 @@ export async function handleOAuth(
 				   own private session and cart.</p>
 				<p class="warn"><strong>This grants the ability to place real orders
 				   and spend real money.</strong> Only continue if you started this.</p>
+
+				<h2 style="font-size:.95rem;margin:1.5rem 0 .25rem">Paste your session (recommended)</h2>
+				<p>Snoonu protects SMS login with reCAPTCHA, which usually blocks
+				   servers hosted in a datacenter. Signing in from your own browser
+				   avoids that entirely.</p>
+				<ol style="color:#a1a1aa;font-size:.85rem;line-height:1.6;padding-left:1.1rem">
+					<li>Open <a href="https://snoonu.com" target="_blank" rel="noopener">snoonu.com</a> and log in as normal.</li>
+					<li>Open DevTools (F12) → Console, paste this, press Enter:</li>
+				</ol>
+				<pre style="background:#0b0b0c;border:1px solid #34343a;border-radius:8px;padding:.6rem;font-size:.72rem;overflow-x:auto;color:#d4d4d8">copy(JSON.stringify({token:document.cookie.match(/authToken=([^;]+)/)?.[1],deviceId:(localStorage.getItem('deviceId')||'').replace(/"/g,'')}))</pre>
+				<p style="font-size:.85rem">It copies a short JSON snippet. Paste it below.</p>
+				<form method="POST">
+					${hidden({ step: "token" })}
+					<input name="session" placeholder='{"token":"...","deviceId":"..."}' autofocus required>
+					<button type="submit">Connect</button>
+				</form>
+
+				<h2 style="font-size:.95rem;margin:2rem 0 .25rem">Or sign in by SMS</h2>
+				<p>Only works if this server's IP isn't blocked by reCAPTCHA.</p>
 				<form method="POST">
 					${hidden({ step: "phone" })}
 					<input name="phone" inputmode="tel" autocomplete="tel"
-					       placeholder="Phone number (e.g. 55123456)" autofocus required>
-					<button type="submit">Send code</button>
+					       placeholder="Phone number (e.g. 55123456)" required>
+					<button type="submit" style="background:#3f3f46">Send code</button>
 				</form>`);
 		}
 
 		if (req.method === "POST") {
 			const step = param("step");
+
+			// Paste-your-session path. Works from any host because the credential
+			// was minted in the user's own browser, where reCAPTCHA passes.
+			if (step === "token") {
+				let authToken = "";
+				let deviceId = "";
+				try {
+					const parsed = JSON.parse(param("session").trim());
+					authToken = String(parsed.token ?? parsed.authToken ?? "").trim();
+					deviceId = String(parsed.deviceId ?? parsed.device_id ?? "").trim();
+				} catch {
+					return html(
+						`<h1>Couldn't read that</h1><p>Paste the whole JSON snippet the console copied, including the braces.</p>`,
+						400,
+					);
+				}
+				if (!authToken || !deviceId) {
+					return html(
+						`<h1>Missing token or deviceId</h1><p>Make sure you are logged in to snoonu.com before running the snippet.</p>`,
+						400,
+					);
+				}
+
+				const identity = await fetchIdentity(authToken, deviceId).catch(() => null);
+				if (!identity) {
+					return html(
+						`<h1>That session isn't valid</h1>
+						 <p>Snoonu rejected it. Log in to snoonu.com again and re-copy the snippet — tokens expire.</p>`,
+						401,
+					);
+				}
+
+				const uid = userIdForPhone(identity.phone);
+				await runAsUser(uid, () =>
+					saveSession({
+						authToken,
+						deviceId,
+						locationToken: "",
+						location: {
+							latitude: "25.285564",
+							longitude: "51.531445",
+							address: "Doha, Qatar",
+						},
+						cookies: [],
+						savedAt: new Date().toISOString(),
+					}),
+				);
+				console.error(
+					`[oauth] session accepted for ...${identity.phone.slice(-3)} (${uid})`,
+				);
+
+				const code = issueAuthorizationCode({
+					clientId,
+					redirectUri,
+					codeChallenge: challenge,
+					resource,
+					scope,
+					userId: uid,
+				});
+				const target = new URL(redirectUri);
+				target.searchParams.set("code", code);
+				if (state) target.searchParams.set("state", state);
+				target.searchParams.set("iss", cfg.issuer);
+				return Response.redirect(target.toString(), 302);
+			}
 
 			// Step 2 — trigger the Snoonu OTP for that number.
 			if (step === "phone") {
@@ -449,12 +535,25 @@ export async function handleOAuth(
 				// Start the login inside that user's own context so the OTP and
 				// resulting cookies land in their session, not a shared one.
 				// NOT awaited — see the note on PendingLogin.otpRequest.
-				const otpRequest = runAsUser(userId, () => requestOtp(phone)).catch(
-					(err: unknown) => ({
+				const startedAt = Date.now();
+				const otpRequest = runAsUser(userId, () => requestOtp(phone))
+					.catch((err: unknown) => ({
 						success: false,
 						message: err instanceof Error ? err.message : String(err),
-					}),
-				);
+					}))
+					.then((r) => {
+						// Log the OUTCOME. The form is rendered before this settles,
+						// so without this line a failure at second 30 is completely
+						// silent: the user is told "code sent" and simply never
+						// receives one, with nothing in the logs to explain it.
+						const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+						console.error(
+							r.success
+								? `[oauth] OTP requested for ...${phone.slice(-3)} in ${secs}s`
+								: `[oauth] OTP request FAILED for ...${phone.slice(-3)} after ${secs}s: ${r.message}`,
+						);
+						return r;
+					});
 
 				const loginId = randomBytes(24).toString("base64url");
 				logins.set(loginId, {
@@ -483,7 +582,11 @@ export async function handleOAuth(
 
 				return html(`
 					<h1>Enter your code</h1>
-					<p>We sent a 6-digit code to <strong>${escapeHtml(phone)}</strong>.</p>
+					<p>Sending a 6-digit code to <strong>${escapeHtml(phone)}</strong>.
+					   It can take up to a minute to arrive.</p>
+					<p>If nothing arrives, the server could not complete the Snoonu
+					   login — check the server logs for <code>[oauth] OTP request
+					   FAILED</code>.</p>
 					<form method="POST">
 						${hidden({ step: "otp", login_id: loginId })}
 						<input name="otp" inputmode="numeric" autocomplete="one-time-code"
