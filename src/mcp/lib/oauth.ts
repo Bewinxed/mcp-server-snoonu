@@ -427,37 +427,46 @@ export async function handleOAuth(
 				<p class="warn"><strong>This grants the ability to place real orders
 				   and spend real money.</strong> Only continue if you started this.</p>
 
-				<h2 style="font-size:.95rem;margin:1.5rem 0 .25rem">Paste your session (recommended)</h2>
-				<p>Snoonu protects SMS login with reCAPTCHA, which usually blocks
-				   servers hosted in a datacenter. Signing in from your own browser
-				   avoids that entirely.</p>
-				<ol style="color:#a1a1aa;font-size:.85rem;line-height:1.6;padding-left:1.1rem">
-					<li>Open <a href="https://snoonu.com" target="_blank" rel="noopener">snoonu.com</a> and log in as normal.</li>
-					<li>Open DevTools (F12) → Console, paste this, press Enter:</li>
-				</ol>
-				<pre style="background:#0b0b0c;border:1px solid #34343a;border-radius:8px;padding:.6rem;font-size:.72rem;overflow-x:auto;color:#d4d4d8">copy(JSON.stringify({token:document.cookie.match(/authToken=([^;]+)/)?.[1],deviceId:(localStorage.getItem('deviceId')||'').replace(/"/g,'')}))</pre>
-				<p style="font-size:.85rem">It copies a short JSON snippet. Paste it below.</p>
-				<form method="POST">
-					${hidden({ step: "token" })}
-					<input name="session" placeholder='{"token":"...","deviceId":"..."}' autofocus required>
-					<button type="submit">Connect</button>
-				</form>
-
-				<h2 style="font-size:.95rem;margin:2rem 0 .25rem">Or sign in by SMS</h2>
-				<p>Only works if this server's IP isn't blocked by reCAPTCHA.</p>
 				<form method="POST">
 					${hidden({ step: "phone" })}
 					<input name="phone" inputmode="tel" autocomplete="tel"
-					       placeholder="Phone number (e.g. 55123456)" required>
-					<button type="submit" style="background:#3f3f46">Send code</button>
-				</form>`);
+					       placeholder="Phone number (e.g. 55123456)" autofocus required>
+					<button type="submit">Send code</button>
+				</form>
+				<p style="font-size:.8rem">The code can take up to a minute — the server
+				   signs in to Snoonu on your behalf.</p>
+
+				<details style="margin-top:1.75rem">
+					<summary style="cursor:pointer;color:#a1a1aa;font-size:.85rem">
+						SMS not arriving? Paste a session instead
+					</summary>
+					<p style="font-size:.85rem">Snoonu guards login with reCAPTCHA
+					   (<code>use_google_re_captcha: true</code>). It normally passes, but
+					   if your server's IP is scored badly the code is dropped silently.
+					   Signing in from your own browser sidesteps it.</p>
+					<ol style="color:#a1a1aa;font-size:.85rem;line-height:1.6;padding-left:1.1rem">
+						<li>Open <a href="https://snoonu.com" target="_blank" rel="noopener">snoonu.com</a> and log in as normal.</li>
+						<li>Open DevTools (F12) → Console, paste this, press Enter:</li>
+					</ol>
+					<pre style="background:#0b0b0c;border:1px solid #34343a;border-radius:8px;padding:.6rem;font-size:.72rem;overflow-x:auto;color:#d4d4d8">copy(JSON.stringify({token:document.cookie.match(/authToken=([^;]+)/)?.[1],deviceId:(localStorage.getItem('deviceId')||'').replace(/"/g,'')}))</pre>
+					<form method="POST">
+						${hidden({ step: "token" })}
+						<input name="session" placeholder='{"token":"...","deviceId":"..."}' required>
+						<button type="submit" style="background:#3f3f46">Connect with session</button>
+					</form>
+				</details>`);
 		}
 
 		if (req.method === "POST") {
 			const step = param("step");
 
-			// Paste-your-session path. Works from any host because the credential
-			// was minted in the user's own browser, where reCAPTCHA passes.
+			// Paste-your-session path — a fallback, not the default.
+			//
+			// SMS login does work from a datacenter host (confirmed in production
+			// once the request stopped being killed by the proxy timeout). Snoonu
+			// does gate OTP behind reCAPTCHA, so a badly-scored IP can still drop
+			// the code silently; this path exists for that case, because the
+			// credential is minted in the user's own browser instead.
 			if (step === "token") {
 				let authToken = "";
 				let deviceId = "";
