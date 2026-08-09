@@ -449,6 +449,27 @@ if (!allowedHosts) {
 	);
 }
 
+/**
+ * Chromium is only needed for login and checkout, so a broken install stays
+ * invisible until a user is halfway through OAuth and gets a 502. Probe it once
+ * in the background and say so up front instead.
+ */
+void (async () => {
+	if (!OAUTH_ENABLED) return;
+	try {
+		const { chromium } = await import("playwright");
+		const b = await chromium.launch({ headless: true });
+		await b.close();
+		console.error("  Browser: Chromium OK (login + checkout available)");
+	} catch (err) {
+		console.error(
+			`\n  WARNING: Chromium is not usable — OAuth sign-in and checkout WILL fail.\n` +
+				`  ${(err as Error).message.split("\n")[0]}\n` +
+				`  Fix with: npx playwright install --with-deps chromium`,
+		);
+	}
+})();
+
 async function shutdown(): Promise<void> {
 	await flush().catch(() => {});
 	// Tear down every user's browser context, then the shared process.

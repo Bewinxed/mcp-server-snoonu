@@ -179,7 +179,42 @@ interface PendingLogin {
 	phone: string;
 	/** Carried through the OTP step so the redirect can be completed after. */
 	params: Record<string, string>;
+	/**
+	 * The in-flight OTP request. Deliberately NOT awaited before responding.
+	 *
+	 * Requesting the code can take up to ~106s of Playwright timeouts (Chromium
+	 * launch, hydration wait, the location-modal retry loop, waiting for the PIN
+	 * screen). Blocking the HTTP response on that blew straight through
+	 * Coolify/Traefik's ~60s proxy timeout and the user got a 502 right after
+	 * entering their number.
+	 *
+	 * Snoonu sends the SMS regardless of whether our response is still open, so
+	 * the request is started, the OTP form is rendered immediately, and this
+	 * promise is awaited later — by which time it has usually settled.
+	 */
+	otpRequest: Promise<{ success: boolean; message: string }>;
 	expiresAt: number;
+}
+
+/** Resolve a promise or give up after `ms`, without leaving it unhandled. */
+function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
+	return new Promise<T>((resolve) => {
+		const timer = setTimeout(() => resolve(onTimeout), ms);
+		timer.unref?.();
+		p.then(
+			(v) => {
+				clearTimeout(timer);
+				resolve(v);
+			},
+			(err) => {
+				clearTimeout(timer);
+				resolve({
+					...(onTimeout as any),
+					message: err instanceof Error ? err.message : String(err),
+				});
+			},
+		);
+	});
 }
 
 const logins = new Map<string, PendingLogin>();
@@ -411,23 +446,40 @@ export async function handleOAuth(
 				}
 
 				const userId = userIdForPhone(phone);
-				// Drive the login inside that user's own context, so the OTP and
-				// the resulting cookies land in their session, not a shared one.
-				const result = await runAsUser(userId, () => requestOtp(phone));
-				if (!result.success) {
-					return html(
-						`<h1>Could not send the code</h1><p>${escapeHtml(result.message)}</p>
-						 <p><a href="${escapeHtml(url.pathname + url.search)}">Try again</a></p>`,
-						502,
-					);
-				}
+				// Start the login inside that user's own context so the OTP and
+				// resulting cookies land in their session, not a shared one.
+				// NOT awaited — see the note on PendingLogin.otpRequest.
+				const otpRequest = runAsUser(userId, () => requestOtp(phone)).catch(
+					(err: unknown) => ({
+						success: false,
+						message: err instanceof Error ? err.message : String(err),
+					}),
+				);
 
 				const loginId = randomBytes(24).toString("base64url");
 				logins.set(loginId, {
 					phone,
 					params: carried,
+					otpRequest,
 					expiresAt: Date.now() + LOGIN_TTL_MS,
 				});
+
+				// Give it a moment to fail fast on obvious errors (no Chromium,
+				// no network) so the user sees a real message instead of typing a
+				// code that will never arrive. Otherwise fall through and let
+				// them wait for the SMS.
+				const early = await withTimeout(otpRequest, 8000, {
+					success: true,
+					message: "",
+				});
+				if (!early.success) {
+					logins.delete(loginId);
+					return html(
+						`<h1>Could not send the code</h1><p>${escapeHtml(early.message)}</p>
+						 <p><a href="${escapeHtml(url.pathname + url.search)}">Try again</a></p>`,
+						502,
+					);
+				}
 
 				return html(`
 					<h1>Enter your code</h1>
@@ -454,6 +506,22 @@ export async function handleOAuth(
 
 				const otp = param("otp").trim();
 				const userId = userIdForPhone(pending.phone);
+
+				// The OTP request may still be in flight (we returned this form
+				// early on purpose). Verifying before the PIN screen exists would
+				// fail spuriously, so wait for it to settle first.
+				const requested = await withTimeout(pending.otpRequest, 60_000, {
+					success: false,
+					message: "Timed out while requesting the code. Start again.",
+				});
+				if (!requested.success) {
+					logins.delete(loginId);
+					return html(
+						`<h1>Could not send the code</h1><p>${escapeHtml(requested.message)}</p>`,
+						502,
+					);
+				}
+
 				const verified = await runAsUser(userId, () => verifyOtp(otp));
 
 				if (!verified.loggedIn) {
