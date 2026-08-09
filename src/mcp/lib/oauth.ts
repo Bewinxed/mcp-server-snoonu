@@ -25,13 +25,26 @@
  * account — each person signs in as themselves, the token's `sub` is derived
  * from their number, and every downstream call runs scoped to that user with
  * their own session, cart, and browser context.
+ *
+ * Login runs over plain HTTP (otp_request_v2 / otp_verify), not Playwright.
+ * The browser path took up to ~106s and died on the proxy timeout; this takes
+ * about a second and needs no Chromium at all.
  */
 
-import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypto";
+import {
+	createHmac,
+	randomBytes,
+	timingSafeEqual,
+	createHash,
+	randomUUID,
+} from "node:crypto";
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
 import { runAsUser } from "./user-context";
-import { requestOtp, verifyOtp } from "../../lib/browser";
-import { fetchIdentity } from "../../lib/api-client";
+import {
+	fetchIdentity,
+	requestOtpViaApi,
+	verifyOtpViaApi,
+} from "../../lib/api-client";
 import { saveSession } from "../../lib/session-manager";
 
 /**
@@ -179,44 +192,14 @@ const LOGIN_TTL_MS = 10 * 60 * 1000;
 
 interface PendingLogin {
 	phone: string;
+	/**
+	 * Snoonu correlates the OTP with the device that requested it, so the SAME
+	 * id must be used for otp_request_v2 and otp_verify.
+	 */
+	deviceId: string;
 	/** Carried through the OTP step so the redirect can be completed after. */
 	params: Record<string, string>;
-	/**
-	 * The in-flight OTP request. Deliberately NOT awaited before responding.
-	 *
-	 * Requesting the code can take up to ~106s of Playwright timeouts (Chromium
-	 * launch, hydration wait, the location-modal retry loop, waiting for the PIN
-	 * screen). Blocking the HTTP response on that blew straight through
-	 * Coolify/Traefik's ~60s proxy timeout and the user got a 502 right after
-	 * entering their number.
-	 *
-	 * Snoonu sends the SMS regardless of whether our response is still open, so
-	 * the request is started, the OTP form is rendered immediately, and this
-	 * promise is awaited later — by which time it has usually settled.
-	 */
-	otpRequest: Promise<{ success: boolean; message: string }>;
 	expiresAt: number;
-}
-
-/** Resolve a promise or give up after `ms`, without leaving it unhandled. */
-function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
-	return new Promise<T>((resolve) => {
-		const timer = setTimeout(() => resolve(onTimeout), ms);
-		timer.unref?.();
-		p.then(
-			(v) => {
-				clearTimeout(timer);
-				resolve(v);
-			},
-			(err) => {
-				clearTimeout(timer);
-				resolve({
-					...(onTimeout as any),
-					message: err instanceof Error ? err.message : String(err),
-				});
-			},
-		);
-	});
 }
 
 const logins = new Map<string, PendingLogin>();
@@ -540,62 +523,43 @@ export async function handleOAuth(
 					);
 				}
 
-				const userId = userIdForPhone(phone);
-				// Start the login inside that user's own context so the OTP and
-				// resulting cookies land in their session, not a shared one.
-				// NOT awaited — see the note on PendingLogin.otpRequest.
-				const startedAt = Date.now();
-				const otpRequest = runAsUser(userId, () => requestOtp(phone))
-					.catch((err: unknown) => ({
+				// Plain HTTP — about a second. The old Playwright path had a ~106s
+				// worst-case budget, blew through the proxy timeout, and made every
+				// failure silent. Snoonu ties the code to the requesting device, so
+				// this id is kept and reused at verification.
+				const deviceId = `web-${randomUUID()}`;
+				const requested = await requestOtpViaApi(phone, deviceId).catch(
+					(err: unknown) => ({
 						success: false,
 						message: err instanceof Error ? err.message : String(err),
-					}))
-					.then((r) => {
-						// Log the OUTCOME. The form is rendered before this settles,
-						// so without this line a failure at second 30 is completely
-						// silent: the user is told "code sent" and simply never
-						// receives one, with nothing in the logs to explain it.
-						const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
-						console.error(
-							r.success
-								? `[oauth] OTP requested for ...${phone.slice(-3)} in ${secs}s`
-								: `[oauth] OTP request FAILED for ...${phone.slice(-3)} after ${secs}s: ${r.message}`,
-						);
-						return r;
-					});
+					}),
+				);
 
-				const loginId = randomBytes(24).toString("base64url");
-				logins.set(loginId, {
-					phone,
-					params: carried,
-					otpRequest,
-					expiresAt: Date.now() + LOGIN_TTL_MS,
-				});
+				console.error(
+					requested.success
+						? `[oauth] OTP sent to ...${phone.slice(-3)}`
+						: `[oauth] OTP request FAILED for ...${phone.slice(-3)}: ${requested.message}`,
+				);
 
-				// Give it a moment to fail fast on obvious errors (no Chromium,
-				// no network) so the user sees a real message instead of typing a
-				// code that will never arrive. Otherwise fall through and let
-				// them wait for the SMS.
-				const early = await withTimeout(otpRequest, 8000, {
-					success: true,
-					message: "",
-				});
-				if (!early.success) {
-					logins.delete(loginId);
+				if (!requested.success) {
 					return html(
-						`<h1>Could not send the code</h1><p>${escapeHtml(early.message)}</p>
+						`<h1>Could not send the code</h1><p>${escapeHtml(requested.message)}</p>
 						 <p><a href="${escapeHtml(url.pathname + url.search)}">Try again</a></p>`,
 						502,
 					);
 				}
 
+				const loginId = randomBytes(24).toString("base64url");
+				logins.set(loginId, {
+					phone,
+					deviceId,
+					params: carried,
+					expiresAt: Date.now() + LOGIN_TTL_MS,
+				});
+
 				return html(`
 					<h1>Enter your code</h1>
-					<p>Sending a 6-digit code to <strong>${escapeHtml(phone)}</strong>.
-					   It can take up to a minute to arrive.</p>
-					<p>If nothing arrives, the server could not complete the Snoonu
-					   login — check the server logs for <code>[oauth] OTP request
-					   FAILED</code>.</p>
+					<p>We sent a 6-digit code to <strong>${escapeHtml(phone)}</strong>.</p>
 					<form method="POST">
 						${hidden({ step: "otp", login_id: loginId })}
 						<input name="otp" inputmode="numeric" autocomplete="one-time-code"
@@ -617,26 +581,19 @@ export async function handleOAuth(
 				}
 
 				const otp = param("otp").trim();
-				const userId = userIdForPhone(pending.phone);
 
-				// The OTP request may still be in flight (we returned this form
-				// early on purpose). Verifying before the PIN screen exists would
-				// fail spuriously, so wait for it to settle first.
-				const requested = await withTimeout(pending.otpRequest, 60_000, {
-					success: false,
-					message: "Timed out while requesting the code. Start again.",
-				});
-				if (!requested.success) {
-					logins.delete(loginId);
-					return html(
-						`<h1>Could not send the code</h1><p>${escapeHtml(requested.message)}</p>`,
-						502,
-					);
-				}
+				const verified = await verifyOtpViaApi(
+					pending.phone,
+					otp,
+					pending.deviceId,
+				).catch((err: unknown) => ({
+					success: false as const,
+					message: err instanceof Error ? err.message : String(err),
+					authToken: undefined,
+					identity: undefined,
+				}));
 
-				const verified = await runAsUser(userId, () => verifyOtp(otp));
-
-				if (!verified.loggedIn) {
+				if (!verified.success || !verified.authToken) {
 					return html(`
 						<h1>That code didn't work</h1>
 						<p>${escapeHtml(verified.message)}</p>
@@ -646,6 +603,26 @@ export async function handleOAuth(
 							<button type="submit">Try again</button>
 						</form>`);
 				}
+
+				// Prefer the phone Snoonu itself reports, so the id is stable even
+				// if the user typed it in a different format than last time.
+				const userId = userIdForPhone(verified.identity?.phone ?? pending.phone);
+
+				await runAsUser(userId, () =>
+					saveSession({
+						authToken: verified.authToken!,
+						deviceId: pending.deviceId,
+						locationToken: "",
+						location: {
+							latitude: "25.285564",
+							longitude: "51.531445",
+							address: "Doha, Qatar",
+						},
+						cookies: [],
+						savedAt: new Date().toISOString(),
+					}),
+				);
+				console.error(`[oauth] signed in ...${pending.phone.slice(-3)} (${userId})`);
 
 				logins.delete(loginId);
 

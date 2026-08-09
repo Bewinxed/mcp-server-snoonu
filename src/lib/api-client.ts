@@ -13,6 +13,7 @@ import {
 	isAuthenticated,
 } from "./session-manager";
 import { PerUser } from "../mcp/lib/user-context";
+import { randomUUID } from "node:crypto";
 import type {
 	ApiResponse,
 	BaseProduct,
@@ -257,6 +258,118 @@ export async function fetchProductById(
 		stockCount: p.stock_count,
 		relevanceScore: null,
 		raw: p as unknown as GlobalSearchProduct,
+	};
+}
+
+// ---------- OTP login over plain HTTP (no browser) ----------
+
+/**
+ * Snoonu's OTP endpoints, usable server-to-server.
+ *
+ * The browser path (Playwright: launch Chromium, wait for hydration, fight the
+ * location modal, type into a controlled React input, wait for the PIN screen)
+ * has a ~106s worst-case budget and blew through the proxy timeout in
+ * production. These two calls do the same job in about a second, and remove the
+ * Chromium dependency from login entirely.
+ *
+ * Two non-obvious details, both verified against the live API:
+ *  - otp_request_v2 reads a header literally named `deviceid`. Sending only
+ *    `snoonu-app-device-id` fails every time with a generic StandardError that
+ *    looks identical to a malformed body.
+ *  - The `token` field is the reCAPTCHA slot. For Qatar (`re_captcha: false` in
+ *    /api/v1/country_codes) it is not actually verified — it only has to be a
+ *    non-empty string. Other countries may genuinely enforce it.
+ */
+const QATAR_DIAL_CODE = "+974";
+
+function otpHeaders(deviceId: string): Record<string, string> {
+	return {
+		accept: "*/*",
+		"content-type": "application/json",
+		appversion: "2",
+		language: "en",
+		latitude: "25.285564",
+		longitude: "51.531445",
+		deviceid: deviceId,
+		"snoonu-app-device-id": deviceId,
+		"snoonu-app-platform": "Web",
+		"snoonu-app-version": "65535.65535.65535.65535",
+	};
+}
+
+/** Ask Snoonu to SMS a login code. Returns a human-readable outcome. */
+export async function requestOtpViaApi(
+	phone: string,
+	deviceId: string,
+	countryCode = QATAR_DIAL_CODE,
+): Promise<{ success: boolean; message: string }> {
+	const res = await fetch(`${SNOONU_API_BASE}/v3/otp_request/otp_request_v2`, {
+		method: "POST",
+		headers: otpHeaders(deviceId),
+		body: JSON.stringify({
+			country_code: countryCode,
+			phone: phone.replace(/\D/g, ""),
+			// reCAPTCHA slot — must be non-empty; not verified for Qatar.
+			token: randomUUID(),
+		}),
+	});
+
+	const data = await res.json().catch(() => null);
+	if (data?.success) {
+		return { success: true, message: data.message ?? "Code sent." };
+	}
+	return {
+		success: false,
+		message:
+			data?.message ??
+			`Snoonu rejected the OTP request (HTTP ${res.status}). Check the phone number.`,
+	};
+}
+
+export interface OtpVerifyResult {
+	success: boolean;
+	message: string;
+	authToken?: string;
+	identity?: SnoonuIdentity;
+}
+
+/** Exchange the SMS code for an auth token. */
+export async function verifyOtpViaApi(
+	phone: string,
+	otp: string,
+	deviceId: string,
+	countryCode = QATAR_DIAL_CODE,
+): Promise<OtpVerifyResult> {
+	const res = await fetch(`${SNOONU_API_BASE}/v3/otp_verify`, {
+		method: "POST",
+		headers: otpHeaders(deviceId),
+		body: JSON.stringify({
+			country_code: countryCode,
+			phone: phone.replace(/\D/g, ""),
+			otp: otp.replace(/\D/g, ""),
+		}),
+	});
+
+	const data = await res.json().catch(() => null);
+	if (!data?.success || !data?.token) {
+		return {
+			success: false,
+			message: data?.message ?? `Verification failed (HTTP ${res.status}).`,
+		};
+	}
+
+	const customer = data.customer ?? {};
+	return {
+		success: true,
+		message: "Signed in.",
+		authToken: data.token,
+		identity: customer?.id
+			? {
+					id: customer.id,
+					phone: String(customer.phone ?? phone),
+					name: customer.name,
+				}
+			: undefined,
 	};
 }
 
