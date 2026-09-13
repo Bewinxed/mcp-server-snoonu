@@ -11,6 +11,7 @@ import {
 	saveSession,
 	getSession,
 	isAuthenticated,
+	BROWSER_HEADERS,
 } from "./session-manager";
 import { PerUser } from "../mcp/lib/user-context";
 import { randomUUID } from "node:crypto";
@@ -286,6 +287,7 @@ const OTP_TIMEOUT_MS = 15_000;
 
 function otpHeaders(deviceId: string): Record<string, string> {
 	return {
+		...BROWSER_HEADERS,
 		accept: "*/*",
 		"content-type": "application/json",
 		appversion: "2",

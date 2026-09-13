@@ -291,6 +291,34 @@ export function getSession(): SnoonuSession | null {
 }
 
 /**
+ * Headers a real snoonu.com tab sends that a bare fetch() does not.
+ *
+ * Snoonu started answering 403 (bare nginx page, no challenge) to a hosted
+ * deployment while the identical call succeeded from a residential
+ * connection. A bare 403 usually means an IP/ASN deny rule rather than bot
+ * detection, but the request was also trivially non-browser: fetch() sends
+ * its own runtime User-Agent and no Origin or Referer at all. This closes
+ * that gap so the difference is only the source address.
+ *
+ * Diagnostically this is also the cheap version of the "use a real browser"
+ * experiment: driving Chromium would not change the source IP, so if a
+ * byte-identical browser header set still gets 403, neither would Playwright.
+ */
+export const BROWSER_HEADERS: Record<string, string> = {
+	"user-agent":
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+	"accept-language": "en-US,en;q=0.9",
+	origin: "https://snoonu.com",
+	referer: "https://snoonu.com/",
+	"sec-ch-ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+	"sec-ch-ua-mobile": "?0",
+	"sec-ch-ua-platform": '"Windows"',
+	"sec-fetch-dest": "empty",
+	"sec-fetch-mode": "cors",
+	"sec-fetch-site": "same-site",
+};
+
+/**
  * Generate headers required for Snoonu API calls.
  */
 export function getApiHeaders(session?: SnoonuSession | null): Record<string, string> {
@@ -305,6 +333,7 @@ export function getApiHeaders(session?: SnoonuSession | null): Record<string, st
 	if (!deviceId) console.error("[session] WARNING: device id resolved to empty string — API calls will return empty results");
 
 	return {
+		...BROWSER_HEADERS,
 		accept: "*/*",
 		"content-type": "application/json",
 		appversion: "2",
