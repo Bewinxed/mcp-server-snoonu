@@ -542,11 +542,31 @@ export async function handleOAuth(
 				);
 
 				if (!requested.success) {
-					return html(
-						`<h1>Could not send the code</h1><p>${escapeHtml(requested.message)}</p>
-						 <p><a href="${escapeHtml(url.pathname + url.search)}">Try again</a></p>`,
-						502,
-					);
+					// Deliberately 200, not 502.
+					//
+					// Snoonu refusing to send a code is an upstream *logical* result,
+					// not a gateway failure of this server — and the status is load
+					// bearing for a second reason: Cloudflare (and most CDNs) discard
+					// an origin 5xx body and substitute their own error page. Emitting
+					// 502 here meant the user saw a bare 16-byte "error code: 502"
+					// while this explanation was thrown away in transit, leaving the
+					// failure undiagnosable from the browser. 4xx/2xx pass through
+					// untouched, so the reason survives.
+					//
+					// Retry is a form rather than a link to url.pathname + url.search:
+					// on this POST the query string is usually empty, so a link would
+					// land on "Missing client_id or redirect_uri". hidden() re-emits
+					// the carried params from the request body instead.
+					return html(`
+						<h1>Could not send the code</h1>
+						<p>${escapeHtml(requested.message)}</p>
+						<form method="POST">
+							${hidden({ step: "phone" })}
+							<input name="phone" inputmode="tel" autocomplete="tel"
+							       value="${escapeHtml(phone)}"
+							       placeholder="Phone number (e.g. 55123456)" autofocus required>
+							<button type="submit">Try again</button>
+						</form>`);
 				}
 
 				const loginId = randomBytes(24).toString("base64url");

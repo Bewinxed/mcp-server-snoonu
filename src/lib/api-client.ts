@@ -281,6 +281,8 @@ export async function fetchProductById(
  *    non-empty string. Other countries may genuinely enforce it.
  */
 const QATAR_DIAL_CODE = "+974";
+/** Upper bound on the Snoonu OTP calls; a stalled connect otherwise hangs sign-in. */
+const OTP_TIMEOUT_MS = 15_000;
 
 function otpHeaders(deviceId: string): Record<string, string> {
 	return {
@@ -303,26 +305,62 @@ export async function requestOtpViaApi(
 	deviceId: string,
 	countryCode = QATAR_DIAL_CODE,
 ): Promise<{ success: boolean; message: string }> {
-	const res = await fetch(`${SNOONU_API_BASE}/v3/otp_request/otp_request_v2`, {
-		method: "POST",
-		headers: otpHeaders(deviceId),
-		body: JSON.stringify({
-			country_code: countryCode,
-			phone: phone.replace(/\D/g, ""),
-			// reCAPTCHA slot — must be non-empty; not verified for Qatar.
-			token: randomUUID(),
-		}),
-	});
+	const url = `${SNOONU_API_BASE}/v3/otp_request/otp_request_v2`;
 
-	const data = await res.json().catch(() => null);
+	let res: Response;
+	try {
+		res = await fetch(url, {
+			method: "POST",
+			headers: otpHeaders(deviceId),
+			body: JSON.stringify({
+				country_code: countryCode,
+				phone: phone.replace(/\D/g, ""),
+				// reCAPTCHA slot — must be non-empty; not verified for Qatar.
+				token: randomUUID(),
+			}),
+			// Without this a stalled connection hangs the sign-in page until the
+			// proxy gives up, which is indistinguishable from a crash.
+			signal: AbortSignal.timeout(OTP_TIMEOUT_MS),
+		});
+	} catch (err) {
+		// Reaching Snoonu at all is the thing that fails when the deployment
+		// host has no egress to admin.snoonu.com, so say that rather than
+		// letting a bare "fetch failed" reach the user.
+		const reason = err instanceof Error ? err.message : String(err);
+		const timedOut = err instanceof Error && err.name === "TimeoutError";
+		return {
+			success: false,
+			message: timedOut
+				? `Snoonu did not respond within ${OTP_TIMEOUT_MS / 1000}s (${url}).`
+				: `Could not reach Snoonu at ${url} — ${reason}. If this server is hosted, check that it has outbound network access to admin.snoonu.com.`,
+		};
+	}
+
+	// Read once as text: a blocked/rate-limited response is often an HTML or
+	// plain-text page, and res.json() would discard the only useful evidence.
+	const body = await res.text().catch(() => "");
+	let data: { success?: boolean; message?: string } | null = null;
+	try {
+		data = JSON.parse(body) as { success?: boolean; message?: string };
+	} catch {
+		data = null;
+	}
+
 	if (data?.success) {
 		return { success: true, message: data.message ?? "Code sent." };
 	}
+	if (data?.message) {
+		return { success: false, message: data.message };
+	}
+	// Non-JSON body => not Snoonu's API talking, but something in front of it
+	// (CDN block page, WAF, captive proxy). "Check the phone number" was the
+	// old guess here and sent people chasing the wrong problem.
+	const snippet = body.replace(/\s+/g, " ").trim().slice(0, 200);
 	return {
 		success: false,
-		message:
-			data?.message ??
-			`Snoonu rejected the OTP request (HTTP ${res.status}). Check the phone number.`,
+		message: `Snoonu returned HTTP ${res.status} with a non-JSON body${
+			snippet ? `: ${snippet}` : "."
+		}`,
 	};
 }
 
