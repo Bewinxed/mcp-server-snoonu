@@ -873,3 +873,156 @@ export async function closeAllBrowsers(): Promise<void> {
 		browser = null;
 	}
 }
+
+// ---------------------------------------------------------------------------
+// OTP over a real browser — the fallback when plain fetch() is refused
+// ---------------------------------------------------------------------------
+
+/**
+ * Issue the OTP calls from inside a real Chromium, on snoonu.com's own origin.
+ *
+ * Snoonu answers plain server-to-server fetch() with a bare nginx 403 from a
+ * Hetzner address while the identical request — same body, same headers, down
+ * to Chrome's User-Agent, Origin, Referer and sec-ch-ua — still succeeds from
+ * a residential connection. A bare 403 with no challenge page normally means
+ * an IP/ASN deny rule, which no client-side change can defeat.
+ *
+ * The one mechanism that could still be client-side is TLS fingerprinting
+ * (JA3/JA4): a WAF can score a datacenter IP presenting a non-browser TLS
+ * handshake differently from one presenting Chrome's. Bun's handshake is not
+ * Chrome's. This path is what distinguishes the two, because here the request
+ * is made BY Chrome — its TLS, its HTTP/2 frame ordering, its origin.
+ *
+ * Deliberately NOT the old login flow. That drove the UI — click login, type
+ * into a controlled React input, wait for the PIN screen — with a ~106s
+ * worst-case budget that blew the proxy timeout and caused the original 502s.
+ * This only borrows the browser's network stack: one navigation to warm the
+ * origin, then fetch() from the page. Seconds, not minutes.
+ */
+async function snoonuFetchInBrowser(
+	path: string,
+	body: Record<string, unknown>,
+	deviceId: string,
+): Promise<{ status: number; text: string }> {
+	const p = await connectBrowser();
+
+	if (!p.url().includes("snoonu.com")) {
+		// Same-origin matters: it makes the call a first-party XHR with the
+		// real Origin/Referer the site itself would send, not a synthetic one.
+		await p.goto("https://snoonu.com", {
+			waitUntil: "domcontentloaded",
+			timeout: 45000,
+		});
+	}
+
+	return p.evaluate(
+		async ({ path, body, deviceId }) => {
+			const res = await fetch(`https://admin.snoonu.com/api${path}`, {
+				method: "POST",
+				headers: {
+					accept: "*/*",
+					"content-type": "application/json",
+					appversion: "2",
+					language: "en",
+					latitude: "25.285564",
+					longitude: "51.531445",
+					// otp_request_v2 reads a header literally named `deviceid`;
+					// sending only snoonu-app-device-id fails every call.
+					deviceid: deviceId,
+					"snoonu-app-device-id": deviceId,
+					"snoonu-app-platform": "Web",
+					"snoonu-app-version": "65535.65535.65535.65535",
+				},
+				body: JSON.stringify(body),
+			});
+			return { status: res.status, text: await res.text() };
+		},
+		{ path, body, deviceId },
+	);
+}
+
+/** Ask Snoonu to SMS a login code, via Chromium. Mirrors requestOtpViaApi. */
+export async function requestOtpViaBrowser(
+	phone: string,
+	deviceId: string,
+	countryCode = "+974",
+): Promise<{ success: boolean; message: string }> {
+	const { status, text } = await snoonuFetchInBrowser(
+		"/v3/otp_request/otp_request_v2",
+		{
+			country_code: countryCode,
+			phone: phone.replace(/\D/g, ""),
+			token: crypto.randomUUID(),
+		},
+		deviceId,
+	);
+
+	let data: { success?: boolean; message?: string } | null = null;
+	try {
+		data = JSON.parse(text);
+	} catch {
+		data = null;
+	}
+
+	if (data?.success) return { success: true, message: data.message ?? "Code sent." };
+	if (data?.message) return { success: false, message: data.message };
+	return {
+		success: false,
+		message: `Snoonu returned HTTP ${status} to the browser too: ${text
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 160)}`,
+	};
+}
+
+/** Exchange the SMS code for an auth token, via Chromium. */
+export async function verifyOtpViaBrowser(
+	phone: string,
+	otp: string,
+	deviceId: string,
+	countryCode = "+974",
+): Promise<{
+	success: boolean;
+	message: string;
+	authToken?: string;
+	identity?: { id: number; phone: string; name?: string };
+}> {
+	const { status, text } = await snoonuFetchInBrowser(
+		"/v3/otp_verify",
+		{
+			country_code: countryCode,
+			phone: phone.replace(/\D/g, ""),
+			otp: otp.replace(/\D/g, ""),
+		},
+		deviceId,
+	);
+
+	let data: any = null;
+	try {
+		data = JSON.parse(text);
+	} catch {
+		data = null;
+	}
+
+	if (!data?.success || !data?.token) {
+		return {
+			success: false,
+			message:
+				data?.message ??
+				`Verification failed (HTTP ${status}) via the browser: ${text
+					.replace(/\s+/g, " ")
+					.trim()
+					.slice(0, 160)}`,
+		};
+	}
+
+	const customer = data.customer ?? {};
+	return {
+		success: true,
+		message: "Signed in.",
+		authToken: data.token,
+		identity: customer?.id
+			? { id: customer.id, phone: String(customer.phone ?? phone), name: customer.name }
+			: undefined,
+	};
+}

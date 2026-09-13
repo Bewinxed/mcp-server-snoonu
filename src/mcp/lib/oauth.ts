@@ -46,6 +46,7 @@ import {
 	verifyOtpViaApi,
 } from "../../lib/api-client";
 import { saveSession } from "../../lib/session-manager";
+import { requestOtpViaBrowser, verifyOtpViaBrowser } from "../../lib/browser";
 
 /**
  * The SDK maps OAuthError -> 401/403 with the WWW-Authenticate challenge.
@@ -267,6 +268,23 @@ export function authorizationServerMetadata(cfg: OAuthConfig) {
 // ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
+
+/**
+ * Is this failure Snoonu (or something in front of it) refusing the request,
+ * rather than the request being wrong?
+ *
+ * Only these are worth the cost of launching Chromium. A genuine API
+ * rejection — "Invalid phone number", a wrong OTP — comes back as clean JSON
+ * and would fail identically in a browser, so retrying there just adds
+ * seconds to an error the user needs to see now.
+ */
+function isUpstreamRefusal(message: string): boolean {
+	return (
+		/\bHTTP (401|403|429|5\d\d)\b/.test(message) ||
+		/non-JSON body/i.test(message) ||
+		/could not reach|did not respond/i.test(message)
+	);
+}
 
 function html(body: string, status = 200): Response {
 	return new Response(
@@ -528,12 +546,41 @@ export async function handleOAuth(
 				// failure silent. Snoonu ties the code to the requesting device, so
 				// this id is kept and reused at verification.
 				const deviceId = `web-${randomUUID()}`;
-				const requested = await requestOtpViaApi(phone, deviceId).catch(
+				let requested = await requestOtpViaApi(phone, deviceId).catch(
 					(err: unknown) => ({
 						success: false,
 						message: err instanceof Error ? err.message : String(err),
 					}),
 				);
+
+				// Fall back to a real Chromium when Snoonu refuses the plain call.
+				//
+				// Ordered this way on purpose: the HTTP path answers in ~0.9s and
+				// costs nothing, so the browser is only paid for when it is the
+				// only thing that might work. Gated on refusal rather than run
+				// unconditionally, because launching Chromium on every sign-in is
+				// what produced the original 502s.
+				if (!requested.success && isUpstreamRefusal(requested.message)) {
+					console.error(
+						`[oauth] plain HTTP refused (${requested.message.slice(0, 80)}) — retrying in a browser`,
+					);
+					const viaBrowser = await requestOtpViaBrowser(phone, deviceId).catch(
+						(err: unknown) => ({
+							success: false,
+							message: `Browser fallback failed: ${err instanceof Error ? err.message : String(err)}`,
+						}),
+					);
+					// Keep the browser's message only if it got further; otherwise the
+					// original 403 is the more useful thing to show.
+					if (viaBrowser.success) {
+						requested = viaBrowser;
+					} else {
+						requested = {
+							success: false,
+							message: `${requested.message} — and via a real browser: ${viaBrowser.message}`,
+						};
+					}
+				}
 
 				console.error(
 					requested.success
@@ -602,7 +649,7 @@ export async function handleOAuth(
 
 				const otp = param("otp").trim();
 
-				const verified = await verifyOtpViaApi(
+				let verified = await verifyOtpViaApi(
 					pending.phone,
 					otp,
 					pending.deviceId,
@@ -612,6 +659,28 @@ export async function handleOAuth(
 					authToken: undefined,
 					identity: undefined,
 				}));
+
+				// Same fallback as the phone step. Snoonu ties the code to the
+				// device id, not to the transport that asked for it, and both
+				// paths send the same one — so whichever got through at step 2,
+				// either can verify at step 3. That is why this is symmetric
+				// rather than remembering which transport was used.
+				if (!verified.success && isUpstreamRefusal(verified.message)) {
+					console.error(
+						`[oauth] verify refused over plain HTTP — retrying in a browser`,
+					);
+					const viaBrowser = await verifyOtpViaBrowser(
+						pending.phone,
+						otp,
+						pending.deviceId,
+					).catch((err: unknown) => ({
+						success: false as const,
+						message: `Browser fallback failed: ${err instanceof Error ? err.message : String(err)}`,
+						authToken: undefined,
+						identity: undefined,
+					}));
+					if (viaBrowser.success) verified = viaBrowser;
+				}
 
 				if (!verified.success || !verified.authToken) {
 					return html(`
