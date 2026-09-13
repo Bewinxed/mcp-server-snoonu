@@ -915,7 +915,8 @@ async function snoonuFetchInBrowser(
 		});
 	}
 
-	return p.evaluate(
+	try {
+		return await p.evaluate(
 		async ({ path, body, deviceId }) => {
 			const res = await fetch(`https://admin.snoonu.com/api${path}`, {
 				method: "POST",
@@ -938,7 +939,26 @@ async function snoonuFetchInBrowser(
 			return { status: res.status, text: await res.text() };
 		},
 		{ path, body, deviceId },
-	);
+		);
+	} catch (err) {
+		// "TypeError: Failed to fetch" from inside the page is CORS-opaque: the
+		// custom Snoonu headers force a preflight, and if the OPTIONS is refused
+		// the browser hides the status from JS. A top-level navigation is not
+		// subject to CORS, so it reports what the origin actually answers.
+		const probe = await p
+			.goto(`https://admin.snoonu.com/api${path}`, {
+				waitUntil: "domcontentloaded",
+				timeout: 30000,
+			})
+			.then((r) => (r ? `HTTP ${r.status()}` : "no response"))
+			.catch((e: unknown) => `navigation failed: ${e instanceof Error ? e.message : String(e)}`);
+
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`the in-page request was blocked (${detail.replace(/\s+/g, " ").slice(0, 80)}); ` +
+				`a direct navigation to the same host from this browser returned ${probe}`,
+		);
+	}
 }
 
 /** Ask Snoonu to SMS a login code, via Chromium. Mirrors requestOtpViaApi. */
